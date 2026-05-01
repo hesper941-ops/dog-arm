@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-# 中文说明：
-# ROS2 目标定位节点。
-#
-# 优化点：
-# 1. 不再简单选择 YOLO 置信度最高的目标。
-# 2. 只选择图像安全区域内的目标，过滤靠边目标。
-# 3. 加入目标锁定，避免多个红块之间来回跳。
-# 4. 对 base 坐标做 EMA 滤波，减少坐标抖动。
-#
-# 本节点不连接 /dev/ttyUSB0。
-# 机械臂串口只允许 roarm_driver_node 占用。
 
 import json
 import math
@@ -56,17 +45,11 @@ class TargetLocalizerNode(Node):
 
         self.declare_parameter("base_filter_alpha", 0.55)
 
-        # 困难样本/调试样本保存参数
         self.declare_parameter("save_hard_samples", True)
         self.declare_parameter("hard_sample_conf_thres", 0.75)
         self.declare_parameter("hard_sample_interval_s", 0.8)
         self.declare_parameter("force_save_samples", True)
         self.declare_parameter("force_sample_interval_s", 1.5)
-        self.declare_parameter("hard_sample_dir", "/home/sunrise/dog/ros2_red_block_ws/hard_samples")
-
-        self.declare_parameter("save_hard_samples", True)
-        self.declare_parameter("hard_sample_conf_thres", 0.65)
-        self.declare_parameter("hard_sample_interval_s", 1.0)
         self.declare_parameter("hard_sample_dir", "/home/sunrise/dog/ros2_red_block_ws/hard_samples")
 
         self.model_path = self.get_parameter("model_path").value
@@ -94,15 +77,9 @@ class TargetLocalizerNode(Node):
         self.force_save_samples = bool(self.get_parameter("force_save_samples").value)
         self.force_sample_interval_s = float(self.get_parameter("force_sample_interval_s").value)
         self.hard_sample_dir = self.get_parameter("hard_sample_dir").value
+
         self.last_hard_sample_time = 0.0
         self.last_force_sample_time = 0.0
-        os.makedirs(self.hard_sample_dir, exist_ok=True)
-
-        self.save_hard_samples = bool(self.get_parameter("save_hard_samples").value)
-        self.hard_sample_conf_thres = float(self.get_parameter("hard_sample_conf_thres").value)
-        self.hard_sample_interval_s = float(self.get_parameter("hard_sample_interval_s").value)
-        self.hard_sample_dir = self.get_parameter("hard_sample_dir").value
-        self.last_hard_sample_time = 0.0
         os.makedirs(self.hard_sample_dir, exist_ok=True)
 
         self.pub_target = self.create_publisher(String, "/red_block/target_base", 10)
@@ -323,7 +300,7 @@ class TargetLocalizerNode(Node):
         msg.data = json.dumps(msg_dict, ensure_ascii=False)
         self.pub_target.publish(msg)
 
-        self.maybe_save_hard_sample(bgr, selected, msg_dict)
+        self.maybe_save_samples(bgr, selected, msg_dict)
 
         if self.show_window:
             display = self.draw_debug(bgr, detections, selected, msg_dict)
@@ -333,51 +310,13 @@ class TargetLocalizerNode(Node):
                 self.get_logger().info("Quit key received.")
                 rclpy.shutdown()
 
-
-    def maybe_save_hard_sample(self, bgr, selected, msg_dict):
-        if not self.save_hard_samples:
-            return
-
-        now = time.time()
-        if now - self.last_hard_sample_time < self.hard_sample_interval_s:
-            return
-
-        need_save = False
-
-        if not msg_dict.get("valid", False):
-            need_save = True
-            tag = str(msg_dict.get("reason", "invalid"))
-        else:
-            conf = float(msg_dict.get("confidence", 0.0))
-            if conf < self.hard_sample_conf_thres:
-                need_save = True
-                tag = f"lowconf_{conf:.2f}"
-            else:
-                tag = "normal"
-
-        if not need_save:
-            return
-
-        filename = f"hard_{int(now * 1000)}_{tag}.jpg"
-        path = os.path.join(self.hard_sample_dir, filename)
-
-        image = bgr.copy()
-        if selected is not None:
-            cv2.rectangle(image, (selected.x1, selected.y1), (selected.x2, selected.y2), (0, 255, 255), 2)
-            cx, cy = selected.center
-            cv2.circle(image, (cx, cy), 5, (0, 255, 255), -1)
-
-        cv2.imwrite(path, image)
-        self.last_hard_sample_time = now
-        self.get_logger().info(f"Saved hard sample: {path}")
-
-
     def save_sample_image(self, bgr, selected, msg_dict, tag):
         now = time.time()
         stamp_ms = int(now * 1000)
 
-        image_path = os.path.join(self.hard_sample_dir, f"sample_{stamp_ms}_{tag}.jpg")
-        json_path = os.path.join(self.hard_sample_dir, f"sample_{stamp_ms}_{tag}.json")
+        safe_tag = str(tag).replace("/", "_").replace(" ", "_")
+        image_path = os.path.join(self.hard_sample_dir, f"sample_{stamp_ms}_{safe_tag}.jpg")
+        json_path = os.path.join(self.hard_sample_dir, f"sample_{stamp_ms}_{safe_tag}.json")
 
         image = bgr.copy()
 
@@ -408,9 +347,7 @@ class TargetLocalizerNode(Node):
     def maybe_save_samples(self, bgr, selected, msg_dict):
         now = time.time()
 
-        # 强制采样：不管是否识别成功，每隔一段时间保存一张。
         if self.force_save_samples and now - self.last_force_sample_time >= self.force_sample_interval_s:
-            tag = "force"
             if msg_dict.get("valid", False):
                 conf = float(msg_dict.get("confidence", 0.0))
                 tag = f"force_conf_{conf:.2f}"
