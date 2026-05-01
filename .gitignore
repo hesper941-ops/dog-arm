@@ -7,18 +7,22 @@ log/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# Runtime/debug files
+# Runtime/debug outputs
 hard_samples/
-*.jpg
-*.png
-*.jpeg
+runs/
+*.bag
+*.db3
 *.avi
 *.mp4
-*.db3
-*.bag
 
-# IDE/system
+# Training datasets and archives
+datasets/
+*.zip
+
+# IDE/system files
 .vscode/
 .idea/
 .DS_Store
+Log/
