@@ -171,3 +171,40 @@ LED 测试：
 3. 抽查标签是否与图片一一对应。
 4. 确认无问题后训练新版 YOLO。
 5. 训练完成后替换 ROS2 工程中的模型并进行现场识别验证。
+
+## 开发记录：新版 YOLO 数据集检查
+
+当前已在 RDK X5 上完成新版红色物料数据集位置与基本完整性检查。
+
+已确认的数据集配置文件：
+
+/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v2/red_block_v2.yaml
+
+/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v2_full/red_block_v2_full.yaml
+
+两个 yaml 文件中的 path、train、val 和类别 names 均存在，类别为 red_block。
+
+数据量统计：
+
+red_block_v2:
+- train 图片 36 张，train 标签 36 个
+- val 图片 24 张，val 标签 24 个
+- train 中存在少量空标签文件
+
+red_block_v2_full:
+- train 图片 99 张，train 标签 99 个
+- val 图片 24 张，val 标签 24 个
+- train 中存在较多空标签文件
+
+当前判断：
+
+red_block_v2_full 数据量更多，更适合作为新版 YOLO 的候选训练集。但是由于其中存在较多空标签文件，下一步需要确认这些空标签图片到底是无红块负样本，还是漏标样本。
+
+如果空标签图片确实是不含红块的负样本，可以保留用于降低误检。如果空标签图片中实际存在红块，则需要补标后再训练。
+
+下一步任务：
+
+1. 统计 red_block_v2_full 中空标签文件总数。
+2. 抽查空标签对应图片。
+3. 判断空标签是负样本还是漏标。
+4. 修正数据集后再训练新版 YOLO。
