@@ -110,7 +110,10 @@ class VisualServoTaskNode(Node):
         # ===== 下降测试参数 =====
         self.declare_parameter("descend_test_mm", 30.0)
         self.declare_parameter("descend_step_mm", 5.0)
-        self.declare_parameter("descend_xy_step_mm", 8.0)
+        self.declare_parameter("descend_lock_xy", True)
+        self.declare_parameter("descend_xy_step_mm", 0.0)
+        self.declare_parameter("descend_x_comp_mm_per_mm", 0.0)
+        self.declare_parameter("descend_y_comp_mm_per_mm", 0.0)
         self.declare_parameter("descend_min_z_mm", 30.0)
         self.declare_parameter("descend_min_confidence", 0.60)
         self.declare_parameter("descend_speed", 0.06)
@@ -199,7 +202,10 @@ class VisualServoTaskNode(Node):
         # 下降测试参数
         self.descend_test_mm = float(self.get_parameter("descend_test_mm").value)
         self.descend_step_mm = float(self.get_parameter("descend_step_mm").value)
+        self.descend_lock_xy = self.parse_bool(self.get_parameter("descend_lock_xy").value)
         self.descend_xy_step_mm = float(self.get_parameter("descend_xy_step_mm").value)
+        self.descend_x_comp_mm_per_mm = float(self.get_parameter("descend_x_comp_mm_per_mm").value)
+        self.descend_y_comp_mm_per_mm = float(self.get_parameter("descend_y_comp_mm_per_mm").value)
         self.descend_min_z_mm = float(self.get_parameter("descend_min_z_mm").value)
         self.descend_min_confidence = float(self.get_parameter("descend_min_confidence").value)
         self.descend_speed = float(self.get_parameter("descend_speed").value)
@@ -590,16 +596,23 @@ class VisualServoTaskNode(Node):
             )
             return
 
-        target_base = self.latest_target["base_mm"]
-        target_x = float(target_base["x"]) + self.grasp_offset_x_mm
-        target_y = float(target_base["y"]) + self.grasp_offset_y_mm
+        anchor_pose = self.pre_grasp_pose if self.pre_grasp_pose is not None else pose
+        compensate_x = self.descend_x_comp_mm_per_mm * (self.descend_done_mm + step_z_mm)
+        compensate_y = self.descend_y_comp_mm_per_mm * (self.descend_done_mm + step_z_mm)
 
-        dx = self.limit_delta(target_x - pose["x"], self.descend_xy_step_mm)
-        dy = self.limit_delta(target_y - pose["y"], self.descend_xy_step_mm)
+        if self.descend_lock_xy:
+            target_x = anchor_pose["x"] + compensate_x
+            target_y = anchor_pose["y"] + compensate_y
+        else:
+            target_base = self.latest_target["base_mm"]
+            desired_x = float(target_base["x"]) + self.grasp_offset_x_mm + compensate_x
+            desired_y = float(target_base["y"]) + self.grasp_offset_y_mm + compensate_y
+            target_x = pose["x"] + self.limit_delta(desired_x - pose["x"], self.descend_xy_step_mm)
+            target_y = pose["y"] + self.limit_delta(desired_y - pose["y"], self.descend_xy_step_mm)
 
         descend_target = {
-            "x": pose["x"] + dx,
-            "y": pose["y"] + dy,
+            "x": target_x,
+            "y": target_y,
             "z": target_z,
         }
 

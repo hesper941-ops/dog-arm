@@ -149,7 +149,10 @@ def generate_launch_description():
 
                     "descend_test_mm": 30.0,
                     "descend_step_mm": 5.0,
-                    "descend_xy_step_mm": 8.0,
+                    "descend_lock_xy": True,
+                    "descend_xy_step_mm": 0.0,
+                    "descend_x_comp_mm_per_mm": 0.0,
+                    "descend_y_comp_mm_per_mm": 0.0,
                     "descend_min_z_mm": 30.0,
                     "descend_min_confidence": 0.60,
                     "descend_speed": 0.06,

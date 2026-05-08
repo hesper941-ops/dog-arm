@@ -104,7 +104,9 @@ DONE (完成，发布 reached_descend_test 或 picked_and_placed)
 
 - `descend_test_mm`: 下降距离，默认 30.0 mm
 - `descend_step_mm`: 单次下降步长，默认 5.0 mm
-- `descend_xy_step_mm`: 下降时单步 XY 修正上限，默认 8.0 mm
+- `descend_lock_xy`: 下降时锁定预抓取点 XY，默认 true
+- `descend_xy_step_mm`: 未锁定 XY 时的单步 XY 修正上限，默认 0.0 mm
+- `descend_x_comp_mm_per_mm`, `descend_y_comp_mm_per_mm`: 下降时按累计下降距离做 XY 补偿，默认 0.0
 - `descend_min_z_mm`: 最低安全高度，默认 30.0 mm
 - `descend_min_confidence`: 下降阶段最低目标置信度，默认 0.60
 - `descend_speed`: 下降速度，默认 0.06（比视觉闭环移动更慢）
@@ -132,7 +134,7 @@ DONE (完成，发布 reached_descend_test 或 picked_and_placed)
 - 如果当前 z 已低于 `servo_min_z_mm`，先按上一次安全位姿抬升到更高恢复高度
 - 连续多次恢复高度失败后进入 FAIL，避免边恢复边漂移
 - 红块在图像边缘时，不允许继续根据不稳定深度向下移动
-- 下降阶段改为视觉守护小步下降，每步检查目标新鲜度、置信度和像素安全区
+- 下降阶段锁定预抓取点 XY，只做视觉守护小步下降，每步检查目标新鲜度、置信度和像素安全区
 - 下降前检查目标 z 坐标是否低于 `descend_min_z_mm`
 - 抬升和放置前继续调用 `check_target_range` 检查工作空间
 - 若超出安全范围，状态机进入 FAIL，发布错误信息，不继续执行
