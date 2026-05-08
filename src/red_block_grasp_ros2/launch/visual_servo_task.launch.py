@@ -11,6 +11,8 @@ def generate_launch_description():
     handeye_path = LaunchConfiguration("handeye_path")
     arm_port = LaunchConfiguration("arm_port")
     show_window = LaunchConfiguration("show_window")
+    enable_pick_place_sequence = LaunchConfiguration("enable_pick_place_sequence")
+    servo_min_z_mm = LaunchConfiguration("servo_min_z_mm")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -28,6 +30,14 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "show_window",
             default_value="false",
+        ),
+        DeclareLaunchArgument(
+            "enable_pick_place_sequence",
+            default_value="false",
+        ),
+        DeclareLaunchArgument(
+            "servo_min_z_mm",
+            default_value="80.0",
         ),
 
         Node(
@@ -119,6 +129,7 @@ def generate_launch_description():
                     "grasp_offset_y_mm": 0.0,
                     "grasp_offset_z_mm": 0.0,
                     "min_safe_z_mm": 30.0,
+                    "servo_min_z_mm": servo_min_z_mm,
 
                     "image_width": 640,
                     "image_height": 480,
@@ -138,6 +149,21 @@ def generate_launch_description():
                     "descend_min_z_mm": 30.0,
                     "descend_speed": 0.06,
                     "descend_wait_s": 2.0,
+
+                    "enable_pick_place_sequence": enable_pick_place_sequence,
+                    "gripper_close_deg": 55.0,
+                    "gripper_open_deg": 110.0,
+                    "gripper_speed_deg_s": 25.0,
+                    "gripper_acc": 25.0,
+                    "gripper_wait_s": 1.0,
+                    "lift_up_mm": 80.0,
+                    "lift_speed": 0.08,
+                    "lift_wait_s": 2.0,
+                    "place_x_mm": 260.0,
+                    "place_y_mm": 180.0,
+                    "place_z_mm": 120.0,
+                    "place_speed": 0.10,
+                    "place_wait_s": 2.0,
                 }
             ],
         ),

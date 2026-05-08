@@ -86,6 +86,7 @@ class VisualServoTaskNode(Node):
         self.declare_parameter("grasp_offset_y_mm", 0.0)
         self.declare_parameter("grasp_offset_z_mm", 0.0)
         self.declare_parameter("min_safe_z_mm", 30.0)
+        self.declare_parameter("servo_min_z_mm", 80.0)
 
         # ===== 图像安全区域 =====
         # 如果红块中心太靠边，只允许更小步运动，防止冲出视野。
@@ -110,8 +111,24 @@ class VisualServoTaskNode(Node):
         self.declare_parameter("descend_speed", 0.06)
         self.declare_parameter("descend_wait_s", 2.0)
 
-        self.auto_start = bool(self.get_parameter("auto_start").value)
-        self.move_once_only = bool(self.get_parameter("move_once_only").value)
+        # ===== 抓取、抬升、放置参数 =====
+        self.declare_parameter("enable_pick_place_sequence", False)
+        self.declare_parameter("gripper_close_deg", 55.0)
+        self.declare_parameter("gripper_open_deg", 110.0)
+        self.declare_parameter("gripper_speed_deg_s", 25.0)
+        self.declare_parameter("gripper_acc", 25.0)
+        self.declare_parameter("gripper_wait_s", 1.0)
+        self.declare_parameter("lift_up_mm", 80.0)
+        self.declare_parameter("lift_speed", 0.08)
+        self.declare_parameter("lift_wait_s", 2.0)
+        self.declare_parameter("place_x_mm", 260.0)
+        self.declare_parameter("place_y_mm", 180.0)
+        self.declare_parameter("place_z_mm", 120.0)
+        self.declare_parameter("place_speed", 0.10)
+        self.declare_parameter("place_wait_s", 2.0)
+
+        self.auto_start = self.parse_bool(self.get_parameter("auto_start").value)
+        self.move_once_only = self.parse_bool(self.get_parameter("move_once_only").value)
 
         self.init_pose = {
             "b": float(self.get_parameter("init_b_deg").value),
@@ -125,7 +142,7 @@ class VisualServoTaskNode(Node):
         self.init_acc = float(self.get_parameter("init_acc").value)
         self.initial_wait_s = float(self.get_parameter("initial_wait_s").value)
 
-        self.enable_b_scan = bool(self.get_parameter("enable_b_scan").value)
+        self.enable_b_scan = self.parse_bool(self.get_parameter("enable_b_scan").value)
         self.b_scan_offsets = self.parse_offsets(self.get_parameter("b_scan_offsets").value)
         self.scan_timeout_s = float(self.get_parameter("scan_timeout_s").value)
         self.after_scan_pose_wait_s = float(self.get_parameter("after_scan_pose_wait_s").value)
@@ -136,7 +153,7 @@ class VisualServoTaskNode(Node):
         self.move_speed = float(self.get_parameter("move_speed").value)
         self.step_wait_s = float(self.get_parameter("step_wait_s").value)
 
-        self.enable_e_pixel_servo = bool(self.get_parameter("enable_e_pixel_servo").value)
+        self.enable_e_pixel_servo = self.parse_bool(self.get_parameter("enable_e_pixel_servo").value)
         self.desired_pixel_v = float(self.get_parameter("desired_pixel_v").value)
         self.pixel_v_deadband = float(self.get_parameter("pixel_v_deadband").value)
         self.e_kp_deg_per_px = float(self.get_parameter("e_kp_deg_per_px").value)
@@ -155,6 +172,7 @@ class VisualServoTaskNode(Node):
         self.grasp_offset_y_mm = float(self.get_parameter("grasp_offset_y_mm").value)
         self.grasp_offset_z_mm = float(self.get_parameter("grasp_offset_z_mm").value)
         self.min_safe_z_mm = float(self.get_parameter("min_safe_z_mm").value)
+        self.servo_min_z_mm = float(self.get_parameter("servo_min_z_mm").value)
 
         self.image_width = int(self.get_parameter("image_width").value)
         self.image_height = int(self.get_parameter("image_height").value)
@@ -175,6 +193,22 @@ class VisualServoTaskNode(Node):
         self.descend_min_z_mm = float(self.get_parameter("descend_min_z_mm").value)
         self.descend_speed = float(self.get_parameter("descend_speed").value)
         self.descend_wait_s = float(self.get_parameter("descend_wait_s").value)
+
+        # 抓取、抬升、放置参数
+        self.enable_pick_place_sequence = self.parse_bool(self.get_parameter("enable_pick_place_sequence").value)
+        self.gripper_close_deg = float(self.get_parameter("gripper_close_deg").value)
+        self.gripper_open_deg = float(self.get_parameter("gripper_open_deg").value)
+        self.gripper_speed_deg_s = float(self.get_parameter("gripper_speed_deg_s").value)
+        self.gripper_acc = float(self.get_parameter("gripper_acc").value)
+        self.gripper_wait_s = float(self.get_parameter("gripper_wait_s").value)
+        self.lift_up_mm = float(self.get_parameter("lift_up_mm").value)
+        self.lift_speed = float(self.get_parameter("lift_speed").value)
+        self.lift_wait_s = float(self.get_parameter("lift_wait_s").value)
+        self.place_x_mm = float(self.get_parameter("place_x_mm").value)
+        self.place_y_mm = float(self.get_parameter("place_y_mm").value)
+        self.place_z_mm = float(self.get_parameter("place_z_mm").value)
+        self.place_speed = float(self.get_parameter("place_speed").value)
+        self.place_wait_s = float(self.get_parameter("place_wait_s").value)
 
         self.pub_cmd = self.create_publisher(String, "/roarm_m3/cmd", 10)
         self.pub_state = self.create_publisher(String, "/red_block/visual_servo_state", 10)
@@ -222,6 +256,14 @@ class VisualServoTaskNode(Node):
             if item:
                 result.append(float(item))
         return result if result else [0.0]
+
+    @staticmethod
+    def parse_bool(value):
+        if isinstance(value, bool):
+            return value
+
+        text = str(value).strip().lower()
+        return text in ("1", "true", "yes", "on")
 
     def publish_cmd(self, cmd):
         msg = String()
@@ -383,7 +425,7 @@ class VisualServoTaskNode(Node):
         target_y = float(target_base["y"]) + self.grasp_offset_y_mm
         target_z = max(
             float(target_base["z"]) + self.safe_above_offset_mm + self.grasp_offset_z_mm,
-            self.min_safe_z_mm,
+            self.servo_min_z_mm,
         )
 
         ok, reason = self.check_target_range(target_x, target_y, target_z)
@@ -428,6 +470,14 @@ class VisualServoTaskNode(Node):
         }, dist
 
     def publish_move_pose(self, step_target, pose, label):
+        if step_target["z"] < self.servo_min_z_mm:
+            self.get_logger().warn(
+                f"视觉闭环目标 z={step_target['z']:.1f} mm 低于 servo_min_z_mm="
+                f"{self.servo_min_z_mm:.1f} mm，已钳制。"
+            )
+            step_target = dict(step_target)
+            step_target["z"] = self.servo_min_z_mm
+
         cmd = {
             "type": "move_pose",
             "x": float(step_target["x"]),
@@ -502,6 +552,127 @@ class VisualServoTaskNode(Node):
         self.last_command_time = time.time()
         self.busy = True
         self.enter_state("WAIT_AFTER_DESCEND")
+
+    def publish_gripper_joint(self, angle_deg, label):
+        cmd = {
+            "type": "move_joint",
+            "joint": 6,
+            "angle": float(angle_deg),
+            "speed": self.gripper_speed_deg_s,
+            "acc": self.gripper_acc,
+            "label": label,
+        }
+
+        self.publish_cmd(cmd)
+        self.last_command_time = time.time()
+        self.busy = True
+
+    def publish_recover_servo_height(self, pose):
+        target = {
+            "x": pose["x"],
+            "y": pose["y"],
+            "z": self.servo_min_z_mm,
+        }
+
+        self.get_logger().warn(
+            f"当前 z={pose['z']:.1f} mm 低于视觉闭环安全高度 "
+            f"{self.servo_min_z_mm:.1f} mm，先原地抬升。"
+        )
+        self.publish_move_pose(target, pose, "recover-servo-min-z")
+        self.last_command_time = time.time()
+        self.busy = True
+
+    def do_close_gripper(self):
+        """
+        闭合夹爪。
+        夹爪角度先通过参数保守配置，现场根据实际夹持力度微调。
+        """
+        self.get_logger().info(f"闭爪：g -> {self.gripper_close_deg:.1f} deg")
+        self.publish_gripper_joint(self.gripper_close_deg, "close-gripper")
+        self.enter_state("WAIT_AFTER_CLOSE_GRIPPER")
+
+    def do_open_gripper(self):
+        """
+        打开夹爪，用于放置后释放物料。
+        """
+        self.get_logger().info(f"开爪：g -> {self.gripper_open_deg:.1f} deg")
+        self.publish_gripper_joint(self.gripper_open_deg, "open-gripper")
+        self.enter_state("WAIT_AFTER_OPEN_GRIPPER")
+
+    def publish_pose_with_speed(self, target, pose, speed, label):
+        cmd = {
+            "type": "move_pose",
+            "x": float(target["x"]),
+            "y": float(target["y"]),
+            "z": float(target["z"]),
+            "t": float(pose["t"]),
+            "r": float(pose["r"]),
+            "g": float(pose["g"]),
+            "speed": float(speed),
+            "label": label,
+        }
+
+        self.publish_cmd(cmd)
+        self.last_command_time = time.time()
+        self.busy = True
+
+    def do_lift_after_grasp(self):
+        """
+        闭爪后沿 z 方向抬升，离开物料区域。
+        """
+        if not self.arm_state_is_fresh():
+            self.get_logger().warn("没有新的机械臂状态，等待抬升。")
+            return
+
+        pose = self.get_pose_from_arm_state()
+        target = {
+            "x": pose["x"],
+            "y": pose["y"],
+            "z": pose["z"] + self.lift_up_mm,
+        }
+
+        ok, reason = self.check_target_range(target["x"], target["y"], target["z"])
+        if not ok:
+            self.get_logger().error(f"抬升目标超出工作空间：{reason}")
+            self.enter_state("FAIL")
+            self.publish_state({"error": "lift_out_of_range", "reason": reason, "target": target})
+            return
+
+        self.get_logger().info(
+            f"抬升：当前 z={pose['z']:.1f} mm -> 目标 z={target['z']:.1f} mm "
+            f"（抬升 {self.lift_up_mm:.1f} mm）"
+        )
+        self.publish_pose_with_speed(target, pose, self.lift_speed, "lift-after-grasp")
+        self.enter_state("WAIT_AFTER_LIFT")
+
+    def do_place_move(self):
+        """
+        移动到放置点。
+        放置点使用 base 坐标，由 launch 参数配置。
+        """
+        if not self.arm_state_is_fresh():
+            self.get_logger().warn("没有新的机械臂状态，等待移动到放置点。")
+            return
+
+        pose = self.get_pose_from_arm_state()
+        target = {
+            "x": self.place_x_mm,
+            "y": self.place_y_mm,
+            "z": self.place_z_mm,
+        }
+
+        ok, reason = self.check_target_range(target["x"], target["y"], target["z"])
+        if not ok:
+            self.get_logger().error(f"放置点超出工作空间：{reason}")
+            self.enter_state("FAIL")
+            self.publish_state({"error": "place_out_of_range", "reason": reason, "target": target})
+            return
+
+        self.get_logger().info(
+            f"移动到放置点：x={target['x']:.1f}, y={target['y']:.1f}, z={target['z']:.1f}"
+        )
+        self.publish_pose_with_speed(target, pose, self.place_speed, "move-to-place")
+        self.enter_state("WAIT_AFTER_PLACE")
 
 
     def get_current_e_deg(self):
@@ -605,6 +776,11 @@ class VisualServoTaskNode(Node):
             return
 
         pose = self.get_pose_from_arm_state()
+        if pose["z"] < self.servo_min_z_mm:
+            self.publish_recover_servo_height(pose)
+            self.enter_state("WAIT_AFTER_STEP")
+            return
+
         target_base = self.latest_target["base_mm"]
         target_eef = self.build_target_eef(target_base)
 
@@ -636,6 +812,8 @@ class VisualServoTaskNode(Node):
             label = "edge-safe-step"
 
         step_target, full_dist = self.compute_step_target(pose, target_eef, max_step)
+        if not pixel_safe and step_target["z"] < pose["z"]:
+            step_target["z"] = pose["z"]
 
         self.get_logger().info(
             f"{label}: current=({pose['x']:.1f},{pose['y']:.1f},{pose['z']:.1f}) "
@@ -722,12 +900,64 @@ class VisualServoTaskNode(Node):
         if self.state == "WAIT_AFTER_DESCEND":
             if now - self.last_command_time >= self.descend_wait_s:
                 self.busy = False
+
+                if self.enable_pick_place_sequence:
+                    self.get_logger().info("下降完成。进入闭爪阶段。")
+                    self.enter_state("CLOSE_GRIPPER")
+                else:
+                    self.done = True
+                    self.get_logger().info("下降测试完成。进入 DONE 状态。")
+                    self.enter_state("DONE")
+                    self.publish_state(
+                        {
+                            "result": "reached_descend_test",
+                        }
+                    )
+            return
+
+        if self.state == "CLOSE_GRIPPER":
+            self.do_close_gripper()
+            return
+
+        if self.state == "WAIT_AFTER_CLOSE_GRIPPER":
+            if now - self.last_command_time >= self.gripper_wait_s:
+                self.busy = False
+                self.enter_state("LIFT_AFTER_GRASP")
+            return
+
+        if self.state == "LIFT_AFTER_GRASP":
+            self.do_lift_after_grasp()
+            return
+
+        if self.state == "WAIT_AFTER_LIFT":
+            if now - self.last_command_time >= self.lift_wait_s:
+                self.busy = False
+                self.enter_state("MOVE_TO_PLACE")
+            return
+
+        if self.state == "MOVE_TO_PLACE":
+            self.do_place_move()
+            return
+
+        if self.state == "WAIT_AFTER_PLACE":
+            if now - self.last_command_time >= self.place_wait_s:
+                self.busy = False
+                self.enter_state("OPEN_GRIPPER")
+            return
+
+        if self.state == "OPEN_GRIPPER":
+            self.do_open_gripper()
+            return
+
+        if self.state == "WAIT_AFTER_OPEN_GRIPPER":
+            if now - self.last_command_time >= self.gripper_wait_s:
+                self.busy = False
                 self.done = True
-                self.get_logger().info("下降测试完成。进入 DONE 状态。")
+                self.get_logger().info("抓取、抬升、放置流程完成。进入 DONE 状态。")
                 self.enter_state("DONE")
                 self.publish_state(
                     {
-                        "result": "reached_descend_test",
+                        "result": "picked_and_placed",
                     }
                 )
             return

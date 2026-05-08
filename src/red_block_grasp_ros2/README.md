@@ -12,7 +12,7 @@
 - 通过手眼标定转换到机械臂 base 坐标系
 - 控制 RoArm-M3 移动到红色物料正上方
 - 执行下降测试验证下降方向和安全高度
-- 后续继续完成闭爪、抬升和放置
+- 可选执行闭爪、抬升和放置流程
 
 ## 项目状态（2026-05-08）
 
@@ -23,14 +23,14 @@
 - ✅ 视觉闭环小步移动功能正常
 - ✅ 移动到预抓取点（距红块上方 120mm）功能正常
 - ✅ 下降测试状态已接入
+- ✅ 闭爪、抬升、放置状态已接入，可通过参数开关启用
 
 ### 进行中
 - 🔄 下降测试功能验证
+- 🔄 闭爪角度、抬升距离、放置点现场调优
 
 ### 待接入
-- ⏳ 闭爪动作
-- ⏳ 抬升动作
-- ⏳ 放置动作
+- ⏳ 实物抓取闭环验证
 
 ## ROS2 节点结构
 
@@ -81,7 +81,23 @@ DESCEND_TEST (执行下降测试，沿 z 方向下降)
   ↓
 WAIT_AFTER_DESCEND (等待下降完成)
   ↓
-DONE (完成，发布 reached_descend_test)
+CLOSE_GRIPPER (可选，闭爪)
+  ↓
+WAIT_AFTER_CLOSE_GRIPPER (可选，等待闭爪完成)
+  ↓
+LIFT_AFTER_GRASP (可选，抬升)
+  ↓
+WAIT_AFTER_LIFT (可选，等待抬升完成)
+  ↓
+MOVE_TO_PLACE (可选，移动到放置点)
+  ↓
+WAIT_AFTER_PLACE (可选，等待到达放置点)
+  ↓
+OPEN_GRIPPER (可选，开爪释放)
+  ↓
+WAIT_AFTER_OPEN_GRIPPER (可选，等待开爪完成)
+  ↓
+DONE (完成，发布 reached_descend_test 或 picked_and_placed)
 ```
 
 #### 下降测试参数
@@ -91,9 +107,28 @@ DONE (完成，发布 reached_descend_test)
 - `descend_speed`: 下降速度，默认 0.06（比视觉闭环移动更慢）
 - `descend_wait_s`: 下降后等待时间，默认 2.0 s
 
+#### 抓取、抬升、放置参数
+
+- `enable_pick_place_sequence`: 是否在下降后继续执行抓取放置流程，默认 false
+- `gripper_close_deg`: 闭爪角度，默认 55.0 deg
+- `gripper_open_deg`: 开爪角度，默认 110.0 deg
+- `gripper_speed_deg_s`: 夹爪速度，默认 25.0 deg/s
+- `gripper_acc`: 夹爪加速度，默认 25.0
+- `gripper_wait_s`: 闭爪或开爪后的等待时间，默认 1.0 s
+- `lift_up_mm`: 闭爪后抬升距离，默认 80.0 mm
+- `lift_speed`: 抬升速度，默认 0.08
+- `lift_wait_s`: 抬升后等待时间，默认 2.0 s
+- `place_x_mm`, `place_y_mm`, `place_z_mm`: 放置点 base 坐标，默认 260.0, 180.0, 120.0 mm
+- `place_speed`: 移动到放置点速度，默认 0.10
+- `place_wait_s`: 到达放置点后等待时间，默认 2.0 s
+
 #### 安全保护
 
+- 视觉闭环阶段目标 z 不低于 `servo_min_z_mm`
+- 如果当前 z 已低于 `servo_min_z_mm`，先原地抬升回安全高度
+- 红块在图像边缘时，不允许继续根据不稳定深度向下移动
 - 下降前检查目标 z 坐标是否低于 `descend_min_z_mm`
+- 抬升和放置前继续调用 `check_target_range` 检查工作空间
 - 若超出安全范围，状态机进入 FAIL，发布错误信息，不继续执行
 
 发布：
@@ -117,6 +152,10 @@ DONE (完成，发布 reached_descend_test)
     cd /home/sunrise/dog/ros2_red_block_ws
     source source_red_block.sh
     ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py
+
+启用下降后的抓取、抬升、放置流程：
+
+    ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py enable_pick_place_sequence:=true
 
 注意：运行该 launch 时不要同时运行 `yolo_camera_node`，否则会抢占 Orbbec 相机。
 
