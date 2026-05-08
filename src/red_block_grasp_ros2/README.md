@@ -1,499 +1,257 @@
 # red_block_grasp_ros2
 
-基于 ROS2 Humble 的红色物料识别与 RoArm-M3 机械臂抓取项目。
+基于 ROS2 Humble 的红色物料识别与 RoArm-M3 视觉伺服抓取工程，运行平台为 RDK X5。
 
-## 项目目标
-
-本项目用于完成红色物料抓取任务：
-
-- 使用 Orbbec RGBD 相机获取图像和深度
-- 使用 YOLO 识别红色物料
-- 结合深度图计算目标三维坐标
-- 通过手眼标定转换到机械臂 base 坐标系
-- 控制 RoArm-M3 移动到红色物料正上方
-- 执行下降测试验证下降方向和安全高度
-- 可选执行闭爪、抬升和放置流程
-
-## 项目状态（2026-05-08）
-
-### 已完成
-- ✅ 新版 YOLO 模型（red_block_yolo11n_v3_mix.pt）已训练并验证通过
-- ✅ 识别红块功能正常
-- ✅ 计算 base 坐标功能正常
-- ✅ 视觉闭环小步移动功能正常
-- ✅ 移动到预抓取点（距红块上方 120mm）功能正常
-- ✅ 下降测试状态已接入
-- ✅ 闭爪、抬升、放置状态已接入，可通过参数开关启用
-
-### 进行中
-- 🔄 下降测试功能验证
-- 🔄 闭爪角度、抬升距离、放置点现场调优
-
-### 待接入
-- ⏳ 实物抓取闭环验证
-
-## ROS2 节点结构
-
-### roarm_driver_node
-
-机械臂驱动节点，唯一占用 `/dev/ttyUSB0`。
-
-发布：
-
-- `/roarm_m3/state`
-
-订阅：
-
-- `/roarm_m3/cmd`
-
-### target_localizer_node
-
-视觉定位节点，负责相机、YOLO、深度定位和手眼转换。
-
-发布：
-
-- `/red_block/target_base`
-
-订阅：
-
-- `/roarm_m3/state`
-
-### visual_servo_task_node
-
-视觉闭环任务节点，负责根据目标位置小步控制机械臂运动，并执行下降测试。
-
-### execution_logger_node
-
-轻量运行记录节点，用于保存现场执行数据，方便后续分析视觉闭环行为。
-
-订阅：
-
-- `/roarm_m3/state`
-- `/red_block/target_base`
-- `/red_block/visual_servo_state`
-- `/roarm_m3/cmd`
-
-记录目录：
-
-    /home/sunrise/dog/ros2_red_block_ws/run_records
-
-文件名格式：
-
-    run_YYYYMMDD_HHMMSS.jsonl
-
-每行包含当前时间、最新机械臂状态、最新目标、最新视觉伺服状态和最新命令。
-
-#### 状态机流程
-
-```
-INIT
-  ↓
-WAIT_INITIAL (等待初始姿态到达)
-  ↓
-WAIT_TARGET (等待识别到红块)
-  ↓
-SERVO_STEP (视觉闭环小步移动)
-  ↓
-WAIT_AFTER_STEP (等待移动完成)
-  ↓
-REACHED_PRE_GRASP (到达预抓取点，准备下降)
-  ↓
-DESCEND_TEST (执行下降测试，沿 z 方向下降)
-  ↓
-WAIT_AFTER_DESCEND (等待下降完成)
-  ↓
-CLOSE_GRIPPER (可选，闭爪)
-  ↓
-WAIT_AFTER_CLOSE_GRIPPER (可选，等待闭爪完成)
-  ↓
-LIFT_AFTER_GRASP (可选，抬升)
-  ↓
-WAIT_AFTER_LIFT (可选，等待抬升完成)
-  ↓
-MOVE_TO_PLACE (可选，移动到放置点)
-  ↓
-WAIT_AFTER_PLACE (可选，等待到达放置点)
-  ↓
-OPEN_GRIPPER (可选，开爪释放)
-  ↓
-WAIT_AFTER_OPEN_GRIPPER (可选，等待开爪完成)
-  ↓
-DONE (完成，发布 reached_descend_test 或 picked_and_placed)
-```
-
-#### 下降测试参数
-
-- `descend_test_mm`: 下降距离，默认 30.0 mm
-- `descend_step_mm`: 单次下降步长，默认 5.0 mm
-- `descend_control_mode`: 下降控制模式，默认 pixel
-- `descend_lock_xy`: 下降时锁定预抓取点 XY，默认 true
-- `descend_xy_step_mm`: 未锁定 XY 时的单步 XY 修正上限，默认 0.0 mm
-- `descend_x_comp_mm_per_mm`, `descend_y_comp_mm_per_mm`: 下降时按累计下降距离做 XY 补偿，默认 0.0
-- `descend_desired_pixel_u`, `descend_desired_pixel_v`: 下降时希望红块保持的像素中心，默认 320.0, 240.0
-- `descend_pixel_deadband`: 允许下降的像素误差死区，默认 35.0 px
-- `descend_pixel_kp_mm_per_px`: 像素误差到 XY 修正的比例，默认 0.04 mm/px
-- `descend_pixel_max_xy_step_mm`: 单次像素闭环 XY 修正上限，默认 6.0 mm
-- `descend_pixel_x_sign`, `descend_pixel_y_sign`: 像素闭环 XY 修正方向，默认 1.0, 1.0
-- `descend_min_z_mm`: 最低安全高度，默认 30.0 mm
-- `descend_min_confidence`: 下降阶段最低目标置信度，默认 0.60
-- `descend_speed`: 下降速度，默认 0.06（比视觉闭环移动更慢）
-- `descend_wait_s`: 下降后等待时间，默认 2.0 s
-- `descend_step_wait_s`: 每个下降小步后的等待时间，默认 1.0 s
-
-#### 抓取、抬升、放置参数
-
-- `enable_pick_place_sequence`: 是否在下降后继续执行抓取放置流程，默认 false
-- `gripper_close_deg`: 闭爪角度，默认 55.0 deg
-- `gripper_open_deg`: 开爪角度，默认 110.0 deg
-- `gripper_speed_deg_s`: 夹爪速度，默认 25.0 deg/s
-- `gripper_acc`: 夹爪加速度，默认 25.0
-- `gripper_wait_s`: 闭爪或开爪后的等待时间，默认 1.0 s
-- `lift_up_mm`: 闭爪后抬升距离，默认 80.0 mm
-- `lift_speed`: 抬升速度，默认 0.08
-- `lift_wait_s`: 抬升后等待时间，默认 2.0 s
-- `place_x_mm`, `place_y_mm`, `place_z_mm`: 放置点 base 坐标，默认 260.0, 180.0, 120.0 mm
-- `place_speed`: 移动到放置点速度，默认 0.10
-- `place_wait_s`: 到达放置点后等待时间，默认 2.0 s
-
-#### 轻量自适应步长
-
-视觉闭环阶段支持轻量化自适应步长。它不是强化学习，也不会在线训练模型；只是根据目标像素距离图像中心的程度，在运行时调整本次 `move_pose` 的步长。
-
-- `adaptive_step_enabled`: 是否启用自适应步长，默认 true
-- `adaptive_step_min_mm`: 目标偏离中心时的最小普通步长，默认 5.0 mm
-- `adaptive_step_max_mm`: 目标靠近中心时允许的最大普通步长，默认 25.0 mm
-- `adaptive_edge_step_min_mm`: 目标靠近安全 ROI 边缘时的最小步长，默认 5.0 mm
-- `adaptive_center_good_ratio`: 认为目标足够居中的归一化距离，默认 0.25
-- `adaptive_center_bad_ratio`: 认为目标偏离较大的归一化距离，默认 0.55
-
-如果上一步后目标丢失，下一次视觉闭环步长会临时乘以 0.6，然后恢复正常自适应计算。
-
-#### 安全保护
-
-- 视觉闭环阶段目标 z 不低于 `servo_min_z_mm`
-- 如果当前 z 已低于 `servo_min_z_mm`，先按上一次安全位姿抬升到更高恢复高度
-- 连续多次恢复高度失败后进入 FAIL，避免边恢复边漂移
-- 红块在图像边缘时，不允许继续根据不稳定深度向下移动
-- 下降阶段默认使用像素误差闭环：目标偏离中心时先小步修正视野，目标回到死区内才下降
-- 下降前检查目标 z 坐标是否低于 `descend_min_z_mm`
-- 抬升和放置前继续调用 `check_target_range` 检查工作空间
-- 若超出安全范围，状态机进入 FAIL，发布错误信息，不继续执行
-
-发布：
-
-- `/roarm_m3/cmd`
-- `/red_block/visual_servo_state`
-
-订阅：
-
-- `/roarm_m3/state`
-- `/red_block/target_base`
-
-## 编译
-
-    cd /home/sunrise/dog/ros2_red_block_ws
-    source /opt/ros/humble/setup.bash
-    colcon build --packages-select red_block_grasp_ros2 --event-handlers console_direct+
-
-## 运行
-
-    cd /home/sunrise/dog/ros2_red_block_ws
-    source source_red_block.sh
-    ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py
-
-默认会启动 `execution_logger_node` 并记录运行数据。临时关闭运行记录：
-
-    ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py enable_execution_logger:=false
-
-启用下降后的抓取、抬升、放置流程：
-
-    ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py enable_pick_place_sequence:=true
-
-注意：运行该 launch 时不要同时运行 `yolo_camera_node`，否则会抢占 Orbbec 相机。
-
-## 常用调试命令
-
-查看目标定位：
-
-    ros2 topic echo /red_block/target_base
-
-查看视觉闭环状态：
-
-    ros2 topic echo /red_block/visual_servo_state
-
-查看机械臂状态：
-
-    ros2 topic echo /roarm_m3/state
-
-LED 测试：
-
-    ros2 topic pub --once /roarm_m3/cmd std_msgs/msg/String "{data: '{\"type\":\"set_led\",\"led\":120}'}"
-
-回初始姿态：
-
-    ros2 topic pub --once /roarm_m3/cmd std_msgs/msg/String "{data: '{\"type\":\"set_initial_pose\",\"targets_deg\":{\"b\":0.0,\"s\":0.0,\"e\":70.0,\"t\":90.0,\"r\":-90.0,\"g\":null},\"speed\":35.0,\"acc\":35.0}'}"
-
-## 困难样本采集
-
-困难样本保存目录：
-
-    /home/sunrise/dog/ros2_red_block_ws/hard_samples
-
-查看样本：
-
-    ls -lh /home/sunrise/dog/ros2_red_block_ws/hard_samples | tail
-
-这些样本后续用于补充训练 YOLO v2。
+工程使用 Orbbec RGBD 相机和 YOLO 模型识别红色物块，通过深度图计算目标三维坐标，再结合手眼标定转换到机械臂 base 坐标系，最后由视觉闭环状态机控制机械臂移动到预抓取点并执行安全下降测试。
 
 ## 当前状态
 
 已完成：
 
-- ROS2 功能包搭建
-- 机械臂驱动节点
-- YOLO 视觉定位节点
-- 视觉闭环任务节点
-- launch 一键启动
-- 困难样本采集逻辑
+- 使用 `red_block_yolo11n_v3_mix.pt` 识别红色物块
+- RGBD 深度定位和手眼标定坐标转换
+- 小步视觉闭环移动到预抓取点
+- 预抓取点安全高度控制
+- 下降测试流程
+- 可选闭爪、抬升、移动到放置点、开爪流程
+- 运行数据 JSONL 记录
+- 轻量化自适应视觉伺服步长
 
-待完成：
+仍在现场调优：
 
-- 修复并验证困难样本稳定保存
-- 采集并标注困难样本
-- 重新训练 YOLO v2
-- 接入下降、夹取、抬升和放置流程
-- 后续考虑 RDK X5 BPU 推理加速
+- 眼在手上相机视角变化过快时的目标保持能力
+- 下降距离、速度、单步下降量和最低安全高度
+- 闭爪角度、抬升距离和放置点
 
-## 开发记录：训练集与困难样本位置确认
+## 节点结构
 
-当前已经在 RDK X5 上确认红色物料训练相关数据位置。
+主要节点：
 
-### 困难样本
+- `roarm_driver_node`
+  - 机械臂驱动节点，唯一占用 RoArm-M3 串口，通常为 `/dev/ttyUSB0`
+  - 订阅：`/roarm_m3/cmd`
+  - 发布：`/roarm_m3/state`
 
-困难样本保存目录：
+- `target_localizer_node`
+  - 启动 Orbbec RGBD 相机
+  - 运行 YOLO 检测
+  - 使用深度和手眼标定发布目标 base 坐标
+  - 订阅：`/roarm_m3/state`
+  - 发布：`/red_block/target_base`
 
-/home/sunrise/dog/ros2_red_block_ws/hard_samples
+- `visual_servo_task_node`
+  - 视觉闭环任务状态机
+  - 发布机械臂运动命令
+  - 保留工作空间、高度、ROI、目标新鲜度等安全检查
+  - 订阅：`/roarm_m3/state`、`/red_block/target_base`
+  - 发布：`/roarm_m3/cmd`、`/red_block/visual_servo_state`
 
-该目录中包含自动保存的困难样本图片和对应 JSON 信息，文件名类型包括 force_conf、lowconf、no_detection、force_no_detection。
+- `execution_logger_node`
+  - 记录现场运行数据，方便复盘和调参
+  - 订阅：`/roarm_m3/state`、`/red_block/target_base`、`/red_block/visual_servo_state`、`/roarm_m3/cmd`
+  - 写入：`/home/sunrise/dog/ros2_red_block_ws/run_records`
 
-这些样本主要用于补充新版 YOLO 训练集，重点解决低置信度、漏检、边缘视角和复杂背景下的识别问题。
+注意：运行本任务 launch 时不要同时运行其他占用 Orbbec 相机的节点，尤其不要同时运行 `yolo_camera_node`。
 
-### ROS2 工作区内的数据集
+## X5 运行命令
 
-当前 ROS2 工作区内已经存在两个新版数据集目录：
+```bash
+cd /home/sunrise/dog/ros2_red_block_ws
+git pull
+colcon build --packages-select red_block_grasp_ros2 --event-handlers console_direct+
+source source_red_block.sh
+ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=true
+```
 
-/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v2
+不显示调试窗口：
 
-/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v2_full
+```bash
+ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=false
+```
 
-其中 red_block_v2_full 更可能是后续优先使用的完整训练集版本，需要进一步检查其中的图片数量、标签数量和 red_block_v2_full.yaml 配置是否正确。
+关闭运行日志记录：
 
-### 旧工程数据集与旧训练结果
+```bash
+ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=true enable_execution_logger:=false
+```
 
-旧工程中仍保留了早期红块训练数据和训练结果：
+启用下降后的完整抓取放置流程：
 
-/home/sunrise/dog/red_block_grasp/dataset/red_block_dataset
+```bash
+ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=true enable_pick_place_sequence:=true
+```
 
-/home/sunrise/dog/red_block_grasp/runs/detect/red_block_yolo11n/weights/best.pt
+## 默认文件
 
-旧训练结果可以作为对照模型，但后续 ROS2 工程应优先使用重新整理后的 red_block_v2_full 训练新版 YOLO。
+默认 YOLO 模型：
 
-### 当前 ROS2 工程正在使用的模型
-
-当前 ROS2 工程默认加载的模型为：
-
-/home/sunrise/dog/ros2_red_block_ws/src/red_block_grasp_ros2/models/red_block_yolo11n.pt
-
-后续新版 YOLO 训练完成后，需要将新版 best.pt 复制到 models 目录，或修改 launch 文件中的 model_path 指向新版模型。
-
-### 下一步任务
-
-接下来应先检查并整理数据集：
-
-1. 统计 red_block_v2 和 red_block_v2_full 的图片数量与标签数量。
-2. 检查 red_block_v2_full.yaml 中的 train、val、names 是否正确。
-3. 抽查标签是否与图片一一对应。
-4. 确认无问题后训练新版 YOLO。
-5. 训练完成后替换 ROS2 工程中的模型并进行现场识别验证。
-
-## 开发记录：新版 YOLO 数据集检查
-
-当前已在 RDK X5 上完成新版红色物料数据集位置与基本完整性检查。
-
-已确认的数据集配置文件：
-
-/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v2/red_block_v2.yaml
-
-/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v2_full/red_block_v2_full.yaml
-
-两个 yaml 文件中的 path、train、val 和类别 names 均存在，类别为 red_block。
-
-数据量统计：
-
-red_block_v2:
-- train 图片 36 张，train 标签 36 个
-- val 图片 24 张，val 标签 24 个
-- train 中存在少量空标签文件
-
-red_block_v2_full:
-- train 图片 99 张，train 标签 99 个
-- val 图片 24 张，val 标签 24 个
-- train 中存在较多空标签文件
-
-当前判断：
-
-red_block_v2_full 数据量更多，更适合作为新版 YOLO 的候选训练集。但是由于其中存在较多空标签文件，下一步需要确认这些空标签图片到底是无红块负样本，还是漏标样本。
-
-如果空标签图片确实是不含红块的负样本，可以保留用于降低误检。如果空标签图片中实际存在红块，则需要补标后再训练。
-
-下一步任务：
-
-1. 统计 red_block_v2_full 中空标签文件总数。
-2. 抽查空标签对应图片。
-3. 判断空标签是负样本还是漏标。
-4. 修正数据集后再训练新版 YOLO。
-
-## 开发记录：red_block_v2_full 手动标注检查完成
-
-当前已经完成 red_block_v2_full 数据集的人工标注检查与修改。
-
-数据集路径：
-
-/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v2_full
-
-本次使用自定义 YOLO 标注脚本进行检查，重点检查了：
-
-- 空标签样本
-- lowconf 低置信度样本
-- no_detection 漏检样本
-- force_no_detection 强制采样但未识别样本
-- force_conf_0.2 到 force_conf_0.5 的低置信度样本
-
-标注原则：
-
-- 图片中有红块但无框：补充 red_block 标注框
-- 图片中已有框但位置不准：手动修正
-- 图片中确实没有红块：保留为空标签，作为负样本
-- 图片模糊但仍能判断红块位置：保留并标注
-- 明显不可用图片：后续合并训练集前再统一筛查
-
-已添加自定义标注入口：
-
-/home/sunrise/dog/ros2_red_block_ws/tools/manual_yolo_labeler.py
-
-快捷命令：
-
-biaozhu
-
-常用方式：
-
-biaozhu empty
-biaozhu hard
-biaozhu train
-biaozhu val
-
-当前状态：
-
-red_block_v2_full 已完成手动标注检查，可以进入下一步：合并旧数据集与新困难样本数据集，构建 red_block_v3_mix。
-
-下一步任务：
-
-1. 检查旧数据集 red_block_dataset 的图片和标签完整性。
-2. 新建混合数据集 red_block_v3_mix。
-3. 合并旧数据集和 red_block_v2_full。
-4. 使用旧模型 best.pt 作为初始权重继续训练新版 YOLO。
-5. 训练完成后替换 ROS2 工程中的 red_block_yolo11n.pt 并进行现场识别验证。
-
-## 开发记录：red_block_v3_mix 混合数据集标注检查完成
-
-当前已经完成 red_block_v3_mix 混合数据集的人工标注检查与修改。
-
-混合数据集路径：
-
-/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v3_mix
-
-该数据集由两部分组成：
-
-1. 旧工程红块数据集：
-
-/home/sunrise/dog/red_block_grasp/dataset/red_block_dataset
-
-2. 新采集困难样本数据集：
-
-/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v2_full
-
-混合数据集配置文件：
-
-/home/sunrise/dog/ros2_red_block_ws/datasets/red_block_v3_mix/red_block_v3_mix.yaml
-
-当前已经使用自定义标注脚本对混合数据集进行了人工检查，重点处理：
-
-- 错误标注框
-- 偏移标注框
-- 漏标红块
-- 空标签样本
-- lowconf、no_detection、force_conf、force_no_detection 等困难样本
-
-标注工具入口：
-
-/home/sunrise/dog/ros2_red_block_ws/tools/manual_yolo_labeler.py
-
-混合数据集快捷打开命令：
-
-openmix
-
-常用方式：
-
-openmix train
-openmix val
-openmix empty-train
-openmix empty-val
-openmix hard
-
-重要说明：
-
-从当前节点开始，red_block_v3_mix 作为正式训练集使用。不要再执行 build_red_block_v3_mix.py --overwrite，否则会覆盖已经人工修改过的混合数据集标注。
-
-下一步任务：
-
-1. 使用旧模型 best.pt 作为初始权重继续训练新版 YOLO。
-2. 训练输出新版 red_block_v3_mix 模型。
-3. 将新版 best.pt 替换或复制到 ROS2 工程 models 目录。
-4. 修改 launch 或模型路径，使用新版 YOLO。
-5. 现场验证红块识别稳定性。
-
-## 开发记录：新版 YOLO 模型现场验证通过
-
-当前已经将 PC 端训练得到的新版 YOLO 模型导入 RDK X5，并在 ROS2 主流程中完成现场验证。
-
-新版模型路径：
-
+```text
 /home/sunrise/dog/ros2_red_block_ws/src/red_block_grasp_ros2/models/red_block_yolo11n_v3_mix.pt
+```
 
-当前 launch 已使用新版模型作为默认模型。
+默认手眼标定文件：
 
-验证结果：
+```text
+/home/sunrise/dog/ros2_red_block_ws/src/red_block_grasp_ros2/handeye/handeye_cam_to_eef.json
+```
 
-- target_localizer_node 能正常加载新版 YOLO 模型。
-- Orbbec RGBD 相机能正常启动。
-- /red_block/target_base 能发布有效目标坐标。
-- visual_servo_task_node 能进入 SERVO_STEP。
-- 机械臂驱动节点能收到 move_pose 命令。
-- 当前流程已经能够完成视觉闭环移动到红块上方。
-- 任务状态能够到达 DONE，即 reached_pre_grasp。
+## 状态机流程
 
-当前已完成的主流程：
+主流程：
 
-识别红块
-→ 计算目标 base 坐标
-→ 视觉闭环小步移动
-→ 到达红块上方预抓取点
+```text
+INIT
+-> WAIT_INITIAL
+-> WAIT_TARGET
+-> SERVO_STEP
+-> WAIT_AFTER_STEP
+-> REACHED_PRE_GRASP
+-> DESCEND_TEST
+-> WAIT_AFTER_DESCEND_STEP
+-> WAIT_AFTER_DESCEND
+-> DONE
+```
 
-下一步任务：
+当 `enable_pick_place_sequence:=true` 时，下降后继续执行：
 
-1. 在稳定识别基础上接入下降动作。
-2. 接入闭爪动作。
-3. 接入抬升动作。
-4. 最后再接入放置动作。
-5. 保持分阶段动作，不直接一次性冲到最终抓取点。
+```text
+CLOSE_GRIPPER
+-> WAIT_AFTER_CLOSE_GRIPPER
+-> LIFT_AFTER_GRASP
+-> WAIT_AFTER_LIFT
+-> MOVE_TO_PLACE
+-> WAIT_AFTER_PLACE
+-> OPEN_GRIPPER
+-> WAIT_AFTER_OPEN_GRIPPER
+-> DONE
+```
+
+## 视觉伺服策略
+
+视觉闭环阶段不会一次性冲到最终目标，而是不断发送小步 `move_pose`。这是因为相机固定在机械臂上，机械臂每移动一步，相机视角都会变化；步长过大时，目标容易跑到画面边缘甚至丢失。
+
+当前保护策略：
+
+- 保留 `check_target_range` 工作空间保护
+- 使用 `servo_min_z_mm` 限制视觉闭环阶段最低高度
+- 当前高度过低时先执行恢复抬升
+- 目标靠近安全 ROI 边缘时使用 `edge-safe-step`
+- 根据目标像素点距离图像中心的程度动态调整本次步长
+- 如果发生 `Target lost after step`，下一次步长临时衰减
+
+自适应步长不是强化学习，也不会在线训练模型。它只是根据当前视觉反馈和运行记录做安全的运行时参数自适应。
+
+关键参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `adaptive_step_enabled` | `true` | 是否启用自适应步长 |
+| `max_step_mm` | launch 配置 | 原普通最大步长 |
+| `edge_step_mm` | launch 配置 | 原边缘保护步长 |
+| `adaptive_step_min_mm` | `5.0` | 普通自适应最小步长 |
+| `adaptive_step_max_mm` | `25.0` | 普通自适应最大步长 |
+| `adaptive_edge_step_min_mm` | `5.0` | 边缘保护最小步长 |
+| `adaptive_center_good_ratio` | `0.25` | 认为目标较居中的比例 |
+| `adaptive_center_bad_ratio` | `0.55` | 认为目标偏离较大的比例 |
+
+## 下降测试策略
+
+下降阶段默认使用像素引导的保守下降。只有目标仍然可见、置信度足够、没有跑出安全 ROI，并且像素位置接近图像中心时，机械臂才允许下降。
+
+关键行为：
+
+- 目标丢失、过期、置信度过低或超出安全 ROI 时，不继续下降
+- 目标可见但偏离中心时，只做小步 XY 修正，不下降 Z
+- 目标回到中心死区内时，才下降一个小步
+- 达到下降距离或触发最低安全高度后停止
+
+关键参数：
+
+| 参数 | 典型值 | 说明 |
+| --- | ---: | --- |
+| `descend_test_mm` | `30.0` | 测试总下降距离 |
+| `descend_step_mm` | `5.0` | 单次下降步长 |
+| `descend_control_mode` | `pixel` | 像素引导下降模式 |
+| `descend_min_confidence` | `0.60` | 下降阶段最低目标置信度 |
+| `descend_pixel_deadband` | `35.0` | 允许下降的像素误差死区 |
+| `descend_pixel_kp_mm_per_px` | 现场调参 | 像素误差到 XY 修正的比例 |
+| `descend_pixel_max_xy_step_mm` | 现场调参 | 单次 XY 修正上限 |
+| `descend_min_z_mm` | `30.0` | 最低安全高度 |
+| `descend_speed` | `0.06` | 下降速度 |
+
+如果下降时机械臂明显向前伸，导致物块逐渐跑出相机画面，优先检查和调整：
+
+- 降低 `descend_step_mm`
+- 降低 `descend_pixel_max_xy_step_mm`
+- 检查 `descend_pixel_x_sign` 和 `descend_pixel_y_sign` 方向是否反了
+- 增大 `descend_pixel_deadband` 前先确认目标像素是否稳定
+
+## 运行日志
+
+默认启动 `execution_logger_node`，由 `enable_execution_logger:=true` 控制。
+
+日志目录：
+
+```text
+/home/sunrise/dog/ros2_red_block_ws/run_records
+```
+
+文件名格式：
+
+```text
+run_YYYYMMDD_HHMMSS.jsonl
+```
+
+每行 JSONL 记录包含：
+
+- `stamp`
+- 最新机械臂状态
+- 最新目标定位
+- 最新视觉伺服状态
+- 最新机械臂命令
+
+查看日志：
+
+```bash
+ls -lh /home/sunrise/dog/ros2_red_block_ws/run_records | tail
+tail -f /home/sunrise/dog/ros2_red_block_ws/run_records/<latest_run_file>.jsonl
+```
+
+运行日志用于现场复盘和参数调优，不要提交到 Git。
+
+## 常用调试命令
+
+```bash
+ros2 topic echo /red_block/target_base
+ros2 topic echo /red_block/visual_servo_state
+ros2 topic echo /roarm_m3/state
+ros2 topic echo /roarm_m3/cmd
+```
+
+查看 launch 参数：
+
+```bash
+ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py --show-args
+```
+
+## 推荐调参顺序
+
+1. 机械臂静止时，先确认 `/red_block/target_base` 稳定。
+2. 调 `max_step_mm`、`edge_step_mm` 和自适应步长参数，让视觉闭环移动时目标尽量留在画面中间。
+3. 确认能稳定进入 `REACHED_PRE_GRASP`，且不会反复触发恢复抬升。
+4. 用较小的 `descend_test_mm` 先验证下降方向。
+5. 下降稳定后，再启用 `enable_pick_place_sequence:=true` 测试闭爪、抬升和放置。
+
+## Git 注意事项
+
+不要提交运行产物和训练产物：
+
+- `datasets/`
+- `runs/`
+- `hard_samples/`
+- `run_records/`
+- `build/`
+- `install/`
+- `log/`
+- `Log/`
 
