@@ -104,6 +104,12 @@ class VisualServoTaskNode(Node):
         self.declare_parameter("base_z_min", -30.0)
         self.declare_parameter("base_z_max", 380.0)
 
+        # ===== 下降测试参数 =====
+        self.declare_parameter("descend_test_mm", 30.0)
+        self.declare_parameter("descend_min_z_mm", 30.0)
+        self.declare_parameter("descend_speed", 0.06)
+        self.declare_parameter("descend_wait_s", 2.0)
+
         self.auto_start = bool(self.get_parameter("auto_start").value)
         self.move_once_only = bool(self.get_parameter("move_once_only").value)
 
@@ -164,6 +170,12 @@ class VisualServoTaskNode(Node):
         self.base_z_min = float(self.get_parameter("base_z_min").value)
         self.base_z_max = float(self.get_parameter("base_z_max").value)
 
+        # 下降测试参数
+        self.descend_test_mm = float(self.get_parameter("descend_test_mm").value)
+        self.descend_min_z_mm = float(self.get_parameter("descend_min_z_mm").value)
+        self.descend_speed = float(self.get_parameter("descend_speed").value)
+        self.descend_wait_s = float(self.get_parameter("descend_wait_s").value)
+
         self.pub_cmd = self.create_publisher(String, "/roarm_m3/cmd", 10)
         self.pub_state = self.create_publisher(String, "/red_block/visual_servo_state", 10)
 
@@ -195,6 +207,7 @@ class VisualServoTaskNode(Node):
         self.last_scan_switch_time = time.time()
         self.state_enter_time = time.time()
         self.last_command_time = 0.0
+        self.pre_grasp_pose = None
 
         self.timer = self.create_timer(0.2, self.on_timer)
 
@@ -429,6 +442,67 @@ class VisualServoTaskNode(Node):
 
         self.publish_cmd(cmd)
 
+    def do_descend_test(self):
+        """
+        执行下降测试：
+        - 基于当前位置计算下降后的 z 坐标（z - descend_test_mm）
+        - 检查安全限制（descend_min_z_mm）
+        - 发送 move_pose 命令，使用较慢速度
+        """
+        if not self.arm_state_is_fresh():
+            self.get_logger().warn("没有新的机械臂状态，等待下降。")
+            return
+
+        pose = self.get_pose_from_arm_state()
+        
+        # 计算下降后的目标 z 坐标
+        target_z = pose["z"] - self.descend_test_mm
+        
+        # 检查安全限制
+        if target_z < self.descend_min_z_mm:
+            self.get_logger().error(
+                f"下降目标 z={target_z:.1f} mm 低于安全限制 {self.descend_min_z_mm:.1f} mm，中止。"
+            )
+            self.enter_state("FAIL")
+            self.publish_state(
+                {
+                    "error": "descend_below_safety_limit",
+                    "target_z": target_z,
+                    "min_z": self.descend_min_z_mm,
+                }
+            )
+            return
+        
+        # 构建下降目标位姿
+        descend_target = {
+            "x": pose["x"],
+            "y": pose["y"],
+            "z": target_z,
+        }
+        
+        self.get_logger().info(
+            f"下降测试：当前 z={pose['z']:.1f} mm -> 目标 z={target_z:.1f} mm "
+            f"（下降 {self.descend_test_mm:.1f} mm）"
+        )
+        
+        # 发送下降命令，使用较慢速度
+        cmd = {
+            "type": "move_pose",
+            "x": float(descend_target["x"]),
+            "y": float(descend_target["y"]),
+            "z": float(descend_target["z"]),
+            "t": float(pose["t"]),
+            "r": float(pose["r"]),
+            "g": float(pose["g"]),
+            "speed": self.descend_speed,
+            "label": "descend-test",
+        }
+        
+        self.publish_cmd(cmd)
+        self.last_command_time = time.time()
+        self.busy = True
+        self.enter_state("WAIT_AFTER_DESCEND")
+
 
     def get_current_e_deg(self):
         if self.latest_arm_state is None:
@@ -538,12 +612,13 @@ class VisualServoTaskNode(Node):
         z_error = abs(pose["z"] - target_eef["z"])
 
         if xy_error <= self.target_xy_tolerance_mm and z_error <= self.target_z_tolerance_mm:
-            self.get_logger().info("Visual servo reached pre-grasp target.")
-            self.done = True
-            self.enter_state("DONE")
+            self.get_logger().info("视觉闭环到达预抓取点。现在进入下降测试。")
+            # 保存当前位姿用于下降测试
+            self.pre_grasp_pose = dict(pose)
+            self.enter_state("REACHED_PRE_GRASP")
             self.publish_state(
                 {
-                    "result": "reached_pre_grasp",
+                    "phase": "reached_pre_grasp",
                     "target_eef": target_eef,
                     "xy_error": xy_error,
                     "z_error": z_error,
@@ -633,6 +708,28 @@ class VisualServoTaskNode(Node):
                 else:
                     self.get_logger().warn("Target lost after step. Stop and wait/search.")
                     self.enter_state("WAIT_TARGET")
+            return
+
+        if self.state == "REACHED_PRE_GRASP":
+            self.get_logger().info("REACHED_PRE_GRASP：准备下降测试。")
+            self.enter_state("DESCEND_TEST")
+            return
+
+        if self.state == "DESCEND_TEST":
+            self.do_descend_test()
+            return
+
+        if self.state == "WAIT_AFTER_DESCEND":
+            if now - self.last_command_time >= self.descend_wait_s:
+                self.busy = False
+                self.done = True
+                self.get_logger().info("下降测试完成。进入 DONE 状态。")
+                self.enter_state("DONE")
+                self.publish_state(
+                    {
+                        "result": "reached_descend_test",
+                    }
+                )
             return
 
         if self.state == "DONE":

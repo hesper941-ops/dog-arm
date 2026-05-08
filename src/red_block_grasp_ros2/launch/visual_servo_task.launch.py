@@ -133,6 +133,11 @@ def generate_launch_description():
                     "base_y_max": 450.0,
                     "base_z_min": -30.0,
                     "base_z_max": 380.0,
+
+                    "descend_test_mm": 30.0,
+                    "descend_min_z_mm": 30.0,
+                    "descend_speed": 0.06,
+                    "descend_wait_s": 2.0,
                 }
             ],
         ),
