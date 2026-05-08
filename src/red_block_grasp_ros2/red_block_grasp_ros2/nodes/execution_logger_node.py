@@ -17,8 +17,10 @@ class ExecutionLoggerNode(Node):
         super().__init__("execution_logger_node")
 
         self.declare_parameter("record_dir", "/home/sunrise/dog/ros2_red_block_ws/run_records")
+        self.declare_parameter("flush_interval_s", 1.0)
 
         self.record_dir = Path(str(self.get_parameter("record_dir").value))
+        self.flush_interval_s = float(self.get_parameter("flush_interval_s").value)
         self.record_dir.mkdir(parents=True, exist_ok=True)
 
         filename = time.strftime("run_%Y%m%d_%H%M%S.jsonl", time.localtime())
@@ -29,6 +31,7 @@ class ExecutionLoggerNode(Node):
         self.latest_target = None
         self.latest_visual_servo_state = None
         self.latest_command = None
+        self.last_flush_time = time.time()
 
         self.create_subscription(String, "/roarm_m3/state", self.on_arm_state, 50)
         self.create_subscription(String, "/red_block/target_base", self.on_target, 50)
@@ -55,7 +58,10 @@ class ExecutionLoggerNode(Node):
         }
 
         self.file.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
-        self.file.flush()
+        now = time.time()
+        if self.flush_interval_s <= 0.0 or now - self.last_flush_time >= self.flush_interval_s:
+            self.file.flush()
+            self.last_flush_time = now
 
     def on_arm_state(self, msg):
         self.latest_arm_state = self.decode_json(msg.data)

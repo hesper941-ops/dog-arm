@@ -69,6 +69,12 @@ ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=true
 ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=false
 ```
 
+高帧率现场调试建议先关闭窗口运行：
+
+```bash
+ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=false infer_imgsz:=256 target_timer_period:=0.08
+```
+
 关闭运行日志记录：
 
 ```bash
@@ -145,14 +151,31 @@ CLOSE_GRIPPER
 
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
+| `infer_imgsz` | `256` | YOLO 推理输入尺寸，越小越快，过小会降低识别稳定性 |
+| `target_timer_period` | `0.08` | 目标定位节点调度周期，0.08 约等于最高 12.5 FPS |
+| `show_window` | `false` | 是否显示 OpenCV 调试窗口，开启后会降低 X5 帧率 |
 | `adaptive_step_enabled` | `true` | 是否启用自适应步长 |
 | `max_step_mm` | launch 配置 | 原普通最大步长 |
 | `edge_step_mm` | launch 配置 | 原边缘保护步长 |
+| `move_speed` | `0.12` | 视觉伺服移动速度 |
+| `step_wait_s` | `0.8` | 每次视觉伺服移动后的等待时间 |
 | `adaptive_step_min_mm` | `5.0` | 普通自适应最小步长 |
 | `adaptive_step_max_mm` | `25.0` | 普通自适应最大步长 |
 | `adaptive_edge_step_min_mm` | `5.0` | 边缘保护最小步长 |
 | `adaptive_center_good_ratio` | `0.25` | 认为目标较居中的比例 |
 | `adaptive_center_bad_ratio` | `0.55` | 认为目标偏离较大的比例 |
+
+如果现场仍然只有 1-2 FPS，优先尝试：
+
+```bash
+ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=false enable_execution_logger:=false infer_imgsz:=224 target_timer_period:=0.05
+```
+
+如果识别变快但动作仍然一顿一顿，优先降低等待时间：
+
+```bash
+ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=false step_wait_s:=0.5 move_speed:=0.14
+```
 
 ## 下降测试策略
 
@@ -254,4 +277,3 @@ ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py --show-args
 - `install/`
 - `log/`
 - `Log/`
-

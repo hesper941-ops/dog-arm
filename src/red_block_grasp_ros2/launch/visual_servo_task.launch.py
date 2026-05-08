@@ -15,6 +15,10 @@ def generate_launch_description():
     enable_pick_place_sequence = LaunchConfiguration("enable_pick_place_sequence")
     servo_min_z_mm = LaunchConfiguration("servo_min_z_mm")
     enable_execution_logger = LaunchConfiguration("enable_execution_logger")
+    infer_imgsz = LaunchConfiguration("infer_imgsz")
+    target_timer_period = LaunchConfiguration("target_timer_period")
+    move_speed = LaunchConfiguration("move_speed")
+    step_wait_s = LaunchConfiguration("step_wait_s")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -45,6 +49,22 @@ def generate_launch_description():
             "enable_execution_logger",
             default_value="true",
         ),
+        DeclareLaunchArgument(
+            "infer_imgsz",
+            default_value="256",
+        ),
+        DeclareLaunchArgument(
+            "target_timer_period",
+            default_value="0.08",
+        ),
+        DeclareLaunchArgument(
+            "move_speed",
+            default_value="0.12",
+        ),
+        DeclareLaunchArgument(
+            "step_wait_s",
+            default_value="0.8",
+        ),
 
         Node(
             package="red_block_grasp_ros2",
@@ -70,10 +90,12 @@ def generate_launch_description():
                     "model_path": model_path,
                     "handeye_path": handeye_path,
                     "conf_thres": 0.25,
-                    "infer_imgsz": 320,
-                    "max_targets": 4,
-                    "timer_period": 0.3,
+                    "infer_imgsz": infer_imgsz,
+                    "max_targets": 2,
+                    "timer_period": target_timer_period,
                     "show_window": show_window,
+                    "display_scale": 0.65,
+                    "perf_log_interval_s": 3.0,
 
                     "safe_roi_x_min_ratio": 0.12,
                     "safe_roi_x_max_ratio": 0.88,
@@ -122,8 +144,8 @@ def generate_launch_description():
                     "target_timeout_s": 1.0,
                     "max_step_mm": 25.0,
                     "edge_step_mm": 12.0,
-                    "move_speed": 0.10,
-                    "step_wait_s": 2.0,
+                    "move_speed": move_speed,
+                    "step_wait_s": step_wait_s,
                     "adaptive_step_enabled": True,
                     "adaptive_step_min_mm": 5.0,
                     "adaptive_step_max_mm": 25.0,
@@ -206,6 +228,7 @@ def generate_launch_description():
             parameters=[
                 {
                     "record_dir": "/home/sunrise/dog/ros2_red_block_ws/run_records",
+                    "flush_interval_s": 1.0,
                 }
             ],
         ),

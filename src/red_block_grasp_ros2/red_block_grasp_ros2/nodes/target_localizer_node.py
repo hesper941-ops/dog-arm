@@ -29,10 +29,14 @@ class TargetLocalizerNode(Node):
         )
 
         self.declare_parameter("conf_thres", 0.35)
-        self.declare_parameter("infer_imgsz", 320)
-        self.declare_parameter("max_targets", 4)
-        self.declare_parameter("timer_period", 0.3)
+        self.declare_parameter("infer_imgsz", 256)
+        self.declare_parameter("max_targets", 2)
+        self.declare_parameter("timer_period", 0.08)
         self.declare_parameter("show_window", True)
+        self.declare_parameter("display_scale", 0.75)
+        self.declare_parameter("detector_device", "")
+        self.declare_parameter("detector_half", False)
+        self.declare_parameter("perf_log_interval_s", 3.0)
 
         self.declare_parameter("safe_roi_x_min_ratio", 0.12)
         self.declare_parameter("safe_roi_x_max_ratio", 0.88)
@@ -59,6 +63,10 @@ class TargetLocalizerNode(Node):
         self.max_targets = int(self.get_parameter("max_targets").value)
         self.timer_period = float(self.get_parameter("timer_period").value)
         self.show_window = bool(self.get_parameter("show_window").value)
+        self.display_scale = float(self.get_parameter("display_scale").value)
+        self.detector_device = str(self.get_parameter("detector_device").value)
+        self.detector_half = bool(self.get_parameter("detector_half").value)
+        self.perf_log_interval_s = float(self.get_parameter("perf_log_interval_s").value)
 
         self.safe_roi_x_min_ratio = float(self.get_parameter("safe_roi_x_min_ratio").value)
         self.safe_roi_x_max_ratio = float(self.get_parameter("safe_roi_x_max_ratio").value)
@@ -102,6 +110,8 @@ class TargetLocalizerNode(Node):
             conf_thres=self.conf_thres,
             max_targets=self.max_targets,
             imgsz=self.infer_imgsz,
+            device=self.detector_device,
+            half=self.detector_half,
         )
         self.localizer = TargetLocalizer(
             handeye_path=self.handeye_path,
@@ -112,6 +122,7 @@ class TargetLocalizerNode(Node):
 
         self.window_name = "ROS2 Target Localizer"
         self.last_time = time.time()
+        self.last_perf_log_time = 0.0
         self.fps = 0.0
 
         self.get_logger().info("Starting RGBD camera...")
@@ -122,7 +133,7 @@ class TargetLocalizerNode(Node):
 
         if self.show_window:
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(self.window_name, 1100, 700)
+            cv2.resizeWindow(self.window_name, 800, 520)
 
         self.timer = self.create_timer(self.timer_period, self.on_timer)
 
@@ -223,9 +234,11 @@ class TargetLocalizerNode(Node):
         return dict(self.filtered_base)
 
     def on_timer(self):
+        frame_start = time.time()
         bgr, depth_mm, camera_matrix = self.camera.read(timeout_ms=100)
         if bgr is None or depth_mm is None or camera_matrix is None:
             return
+        read_done = time.time()
 
         now = time.time()
         dt = now - self.last_time
@@ -235,6 +248,7 @@ class TargetLocalizerNode(Node):
 
         image_height, image_width = bgr.shape[:2]
         detections = self.detector.detect(bgr)
+        infer_done = time.time()
 
         selected, select_reason = self.select_detection(detections, image_width, image_height)
 
@@ -299,16 +313,38 @@ class TargetLocalizerNode(Node):
         msg = String()
         msg.data = json.dumps(msg_dict, ensure_ascii=False)
         self.pub_target.publish(msg)
+        publish_done = time.time()
 
         self.maybe_save_samples(bgr, selected, msg_dict)
 
         if self.show_window:
             display = self.draw_debug(bgr, detections, selected, msg_dict)
+            if 0.05 < self.display_scale < 1.0:
+                display = cv2.resize(
+                    display,
+                    None,
+                    fx=self.display_scale,
+                    fy=self.display_scale,
+                    interpolation=cv2.INTER_AREA,
+                )
             cv2.imshow(self.window_name, display)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 self.get_logger().info("Quit key received.")
                 rclpy.shutdown()
+        display_done = time.time()
+
+        if self.perf_log_interval_s > 0 and now - self.last_perf_log_time >= self.perf_log_interval_s:
+            self.last_perf_log_time = now
+            self.get_logger().info(
+                "localizer-perf: "
+                f"fps={self.fps:.1f} "
+                f"read_ms={(read_done - frame_start) * 1000.0:.1f} "
+                f"infer_ms={(infer_done - read_done) * 1000.0:.1f} "
+                f"publish_ms={(publish_done - infer_done) * 1000.0:.1f} "
+                f"display_ms={(display_done - publish_done) * 1000.0:.1f} "
+                f"imgsz={self.infer_imgsz}"
+            )
 
     def save_sample_image(self, bgr, selected, msg_dict, tag):
         now = time.time()

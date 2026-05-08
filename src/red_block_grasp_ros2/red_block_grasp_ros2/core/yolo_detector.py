@@ -48,11 +48,13 @@ class Detection:
 
 
 class YoloRedBlockDetector:
-    def __init__(self, model_path, conf_thres=0.35, max_targets=4, imgsz=320):
+    def __init__(self, model_path, conf_thres=0.35, max_targets=4, imgsz=320, device="", half=False):
         self.model_path = model_path
         self.conf_thres = conf_thres
         self.max_targets = max_targets
         self.imgsz = int(imgsz)
+        self.device = str(device)
+        self.half = bool(half)
         self.model = None
 
     def load(self):
@@ -65,7 +67,22 @@ class YoloRedBlockDetector:
             self.load()
 
         img_h, img_w = bgr_image.shape[:2]
-        results = self.model.predict(source=bgr_image, conf=self.conf_thres, imgsz=self.imgsz, verbose=False)
+        predict_kwargs = {
+            "source": bgr_image,
+            "conf": self.conf_thres,
+            "imgsz": self.imgsz,
+            "verbose": False,
+            "classes": [0],
+            "max_det": self.max_targets,
+        }
+
+        if self.device:
+            predict_kwargs["device"] = self.device
+
+        if self.half:
+            predict_kwargs["half"] = True
+
+        results = self.model.predict(**predict_kwargs)
         detections = []
 
         if not results or results[0].boxes is None:
