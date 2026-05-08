@@ -103,9 +103,13 @@ DONE (完成，发布 reached_descend_test 或 picked_and_placed)
 #### 下降测试参数
 
 - `descend_test_mm`: 下降距离，默认 30.0 mm
+- `descend_step_mm`: 单次下降步长，默认 5.0 mm
+- `descend_xy_step_mm`: 下降时单步 XY 修正上限，默认 8.0 mm
 - `descend_min_z_mm`: 最低安全高度，默认 30.0 mm
+- `descend_min_confidence`: 下降阶段最低目标置信度，默认 0.60
 - `descend_speed`: 下降速度，默认 0.06（比视觉闭环移动更慢）
 - `descend_wait_s`: 下降后等待时间，默认 2.0 s
+- `descend_step_wait_s`: 每个下降小步后的等待时间，默认 1.0 s
 
 #### 抓取、抬升、放置参数
 
@@ -127,6 +131,7 @@ DONE (完成，发布 reached_descend_test 或 picked_and_placed)
 - 视觉闭环阶段目标 z 不低于 `servo_min_z_mm`
 - 如果当前 z 已低于 `servo_min_z_mm`，先原地抬升回安全高度
 - 红块在图像边缘时，不允许继续根据不稳定深度向下移动
+- 下降阶段改为视觉守护小步下降，每步检查目标新鲜度、置信度和像素安全区
 - 下降前检查目标 z 坐标是否低于 `descend_min_z_mm`
 - 抬升和放置前继续调用 `check_target_range` 检查工作空间
 - 若超出安全范围，状态机进入 FAIL，发布错误信息，不继续执行

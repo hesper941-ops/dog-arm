@@ -107,9 +107,13 @@ class VisualServoTaskNode(Node):
 
         # ===== 下降测试参数 =====
         self.declare_parameter("descend_test_mm", 30.0)
+        self.declare_parameter("descend_step_mm", 5.0)
+        self.declare_parameter("descend_xy_step_mm", 8.0)
         self.declare_parameter("descend_min_z_mm", 30.0)
+        self.declare_parameter("descend_min_confidence", 0.60)
         self.declare_parameter("descend_speed", 0.06)
         self.declare_parameter("descend_wait_s", 2.0)
+        self.declare_parameter("descend_step_wait_s", 1.0)
 
         # ===== 抓取、抬升、放置参数 =====
         self.declare_parameter("enable_pick_place_sequence", False)
@@ -190,9 +194,13 @@ class VisualServoTaskNode(Node):
 
         # 下降测试参数
         self.descend_test_mm = float(self.get_parameter("descend_test_mm").value)
+        self.descend_step_mm = float(self.get_parameter("descend_step_mm").value)
+        self.descend_xy_step_mm = float(self.get_parameter("descend_xy_step_mm").value)
         self.descend_min_z_mm = float(self.get_parameter("descend_min_z_mm").value)
+        self.descend_min_confidence = float(self.get_parameter("descend_min_confidence").value)
         self.descend_speed = float(self.get_parameter("descend_speed").value)
         self.descend_wait_s = float(self.get_parameter("descend_wait_s").value)
+        self.descend_step_wait_s = float(self.get_parameter("descend_step_wait_s").value)
 
         # 抓取、抬升、放置参数
         self.enable_pick_place_sequence = self.parse_bool(self.get_parameter("enable_pick_place_sequence").value)
@@ -242,6 +250,8 @@ class VisualServoTaskNode(Node):
         self.state_enter_time = time.time()
         self.last_command_time = 0.0
         self.pre_grasp_pose = None
+        self.descend_done_mm = 0.0
+        self.descend_start_z = None
 
         self.timer = self.create_timer(0.2, self.on_timer)
 
@@ -342,6 +352,28 @@ class VisualServoTaskNode(Node):
         if self.latest_target is None:
             return False
         return time.time() - self.latest_target_time <= self.target_timeout_s
+
+    def target_quality_ok(self, min_confidence=None, require_pixel_safe=False):
+        if not self.target_is_fresh():
+            return False, "target_not_fresh"
+
+        target = self.latest_target
+        if target is None:
+            return False, "no_target"
+
+        try:
+            confidence = float(target.get("confidence", 0.0))
+        except Exception:
+            return False, "bad_confidence"
+
+        threshold = self.descend_min_confidence if min_confidence is None else float(min_confidence)
+        if confidence < threshold:
+            return False, f"low_confidence:{confidence:.2f}"
+
+        if require_pixel_safe and not self.target_pixel_is_safe(target):
+            return False, "pixel_out_of_safe_roi"
+
+        return True, "ok"
 
     def arm_state_is_fresh(self):
         if self.latest_arm_state is None:
@@ -451,6 +483,10 @@ class VisualServoTaskNode(Node):
     def dist_xy(a, b):
         return math.hypot(a["x"] - b["x"], a["y"] - b["y"])
 
+    @staticmethod
+    def limit_delta(value, max_abs):
+        return max(-max_abs, min(max_abs, value))
+
     def compute_step_target(self, current_pose, target_eef, max_step):
         dx = target_eef["x"] - current_pose["x"]
         dy = target_eef["y"] - current_pose["y"]
@@ -494,20 +530,45 @@ class VisualServoTaskNode(Node):
 
     def do_descend_test(self):
         """
-        执行下降测试：
-        - 基于当前位置计算下降后的 z 坐标（z - descend_test_mm）
-        - 检查安全限制（descend_min_z_mm）
-        - 发送 move_pose 命令，使用较慢速度
+        执行视觉守护下降：
+        - 每次只下降 descend_step_mm
+        - 下降前检查目标新鲜度、置信度和像素安全区域
+        - 允许小幅 XY 修正，尽量让红块留在视野中
         """
         if not self.arm_state_is_fresh():
             self.get_logger().warn("没有新的机械臂状态，等待下降。")
             return
 
+        ok, reason = self.target_quality_ok(
+            min_confidence=self.descend_min_confidence,
+            require_pixel_safe=True,
+        )
+        if not ok:
+            self.get_logger().error(f"下降前视觉质量不足，停止下降：{reason}")
+            self.enter_state("FAIL")
+            self.publish_state(
+                {
+                    "error": "descend_target_quality_bad",
+                    "reason": reason,
+                    "descend_done_mm": self.descend_done_mm,
+                }
+            )
+            return
+
         pose = self.get_pose_from_arm_state()
-        
-        # 计算下降后的目标 z 坐标
-        target_z = pose["z"] - self.descend_test_mm
-        
+        if self.descend_start_z is None:
+            self.descend_start_z = pose["z"]
+
+        remaining_mm = self.descend_test_mm - self.descend_done_mm
+        if remaining_mm <= 0.0:
+            self.get_logger().info("视觉守护下降累计距离已完成。")
+            self.enter_state("WAIT_AFTER_DESCEND")
+            self.last_command_time = time.time()
+            return
+
+        step_z_mm = min(self.descend_step_mm, remaining_mm)
+        target_z = pose["z"] - step_z_mm
+
         # 检查安全限制
         if target_z < self.descend_min_z_mm:
             self.get_logger().error(
@@ -522,20 +583,46 @@ class VisualServoTaskNode(Node):
                 }
             )
             return
-        
-        # 构建下降目标位姿
+
+        target_base = self.latest_target["base_mm"]
+        target_x = float(target_base["x"]) + self.grasp_offset_x_mm
+        target_y = float(target_base["y"]) + self.grasp_offset_y_mm
+
+        dx = self.limit_delta(target_x - pose["x"], self.descend_xy_step_mm)
+        dy = self.limit_delta(target_y - pose["y"], self.descend_xy_step_mm)
+
         descend_target = {
-            "x": pose["x"],
-            "y": pose["y"],
+            "x": pose["x"] + dx,
+            "y": pose["y"] + dy,
             "z": target_z,
         }
-        
-        self.get_logger().info(
-            f"下降测试：当前 z={pose['z']:.1f} mm -> 目标 z={target_z:.1f} mm "
-            f"（下降 {self.descend_test_mm:.1f} mm）"
+
+        ok, reason = self.check_target_range(
+            descend_target["x"],
+            descend_target["y"],
+            descend_target["z"],
         )
-        
-        # 发送下降命令，使用较慢速度
+        if not ok:
+            self.get_logger().error(f"下降目标超出工作空间：{reason}")
+            self.enter_state("FAIL")
+            self.publish_state(
+                {
+                    "error": "descend_out_of_range",
+                    "reason": reason,
+                    "target": descend_target,
+                }
+            )
+            return
+
+        confidence = float(self.latest_target.get("confidence", 0.0))
+        pixel = self.latest_target.get("pixel", {})
+        self.get_logger().info(
+            f"视觉守护下降：done={self.descend_done_mm:.1f}/{self.descend_test_mm:.1f} mm "
+            f"conf={confidence:.2f} pixel=({float(pixel.get('x', -1)):.1f},{float(pixel.get('y', -1)):.1f}) "
+            f"current=({pose['x']:.1f},{pose['y']:.1f},{pose['z']:.1f}) "
+            f"target=({descend_target['x']:.1f},{descend_target['y']:.1f},{descend_target['z']:.1f})"
+        )
+
         cmd = {
             "type": "move_pose",
             "x": float(descend_target["x"]),
@@ -545,13 +632,13 @@ class VisualServoTaskNode(Node):
             "r": float(pose["r"]),
             "g": float(pose["g"]),
             "speed": self.descend_speed,
-            "label": "descend-test",
+            "label": "descend-servo-step",
         }
-        
+
         self.publish_cmd(cmd)
         self.last_command_time = time.time()
         self.busy = True
-        self.enter_state("WAIT_AFTER_DESCEND")
+        self.enter_state("WAIT_AFTER_DESCEND_STEP")
 
     def publish_gripper_joint(self, angle_deg, label):
         cmd = {
@@ -890,11 +977,33 @@ class VisualServoTaskNode(Node):
 
         if self.state == "REACHED_PRE_GRASP":
             self.get_logger().info("REACHED_PRE_GRASP：准备下降测试。")
+            self.descend_done_mm = 0.0
+            self.descend_start_z = None
             self.enter_state("DESCEND_TEST")
             return
 
         if self.state == "DESCEND_TEST":
             self.do_descend_test()
+            return
+
+        if self.state == "WAIT_AFTER_DESCEND_STEP":
+            if now - self.last_command_time >= self.descend_step_wait_s:
+                self.busy = False
+
+                if not self.arm_state_is_fresh():
+                    self.get_logger().warn("等待新的机械臂状态以更新下降进度。")
+                    return
+
+                pose = self.get_pose_from_arm_state()
+                if self.descend_start_z is not None:
+                    self.descend_done_mm = max(0.0, self.descend_start_z - pose["z"])
+
+                if self.descend_done_mm >= self.descend_test_mm - 1e-3:
+                    self.get_logger().info("视觉守护下降完成。")
+                    self.last_command_time = now
+                    self.enter_state("WAIT_AFTER_DESCEND")
+                else:
+                    self.enter_state("DESCEND_TEST")
             return
 
         if self.state == "WAIT_AFTER_DESCEND":

@@ -146,9 +146,13 @@ def generate_launch_description():
                     "base_z_max": 380.0,
 
                     "descend_test_mm": 30.0,
+                    "descend_step_mm": 5.0,
+                    "descend_xy_step_mm": 8.0,
                     "descend_min_z_mm": 30.0,
+                    "descend_min_confidence": 0.60,
                     "descend_speed": 0.06,
                     "descend_wait_s": 2.0,
+                    "descend_step_wait_s": 1.0,
 
                     "enable_pick_place_sequence": enable_pick_place_sequence,
                     "gripper_close_deg": 55.0,
