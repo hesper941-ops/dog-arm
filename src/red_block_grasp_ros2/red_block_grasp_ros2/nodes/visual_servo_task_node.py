@@ -110,10 +110,18 @@ class VisualServoTaskNode(Node):
         # ===== 下降测试参数 =====
         self.declare_parameter("descend_test_mm", 30.0)
         self.declare_parameter("descend_step_mm", 5.0)
+        self.declare_parameter("descend_control_mode", "pixel")
         self.declare_parameter("descend_lock_xy", True)
         self.declare_parameter("descend_xy_step_mm", 0.0)
         self.declare_parameter("descend_x_comp_mm_per_mm", 0.0)
         self.declare_parameter("descend_y_comp_mm_per_mm", 0.0)
+        self.declare_parameter("descend_desired_pixel_u", 320.0)
+        self.declare_parameter("descend_desired_pixel_v", 240.0)
+        self.declare_parameter("descend_pixel_deadband", 35.0)
+        self.declare_parameter("descend_pixel_kp_mm_per_px", 0.04)
+        self.declare_parameter("descend_pixel_max_xy_step_mm", 6.0)
+        self.declare_parameter("descend_pixel_x_sign", 1.0)
+        self.declare_parameter("descend_pixel_y_sign", 1.0)
         self.declare_parameter("descend_min_z_mm", 30.0)
         self.declare_parameter("descend_min_confidence", 0.60)
         self.declare_parameter("descend_speed", 0.06)
@@ -202,10 +210,18 @@ class VisualServoTaskNode(Node):
         # 下降测试参数
         self.descend_test_mm = float(self.get_parameter("descend_test_mm").value)
         self.descend_step_mm = float(self.get_parameter("descend_step_mm").value)
+        self.descend_control_mode = str(self.get_parameter("descend_control_mode").value).strip().lower()
         self.descend_lock_xy = self.parse_bool(self.get_parameter("descend_lock_xy").value)
         self.descend_xy_step_mm = float(self.get_parameter("descend_xy_step_mm").value)
         self.descend_x_comp_mm_per_mm = float(self.get_parameter("descend_x_comp_mm_per_mm").value)
         self.descend_y_comp_mm_per_mm = float(self.get_parameter("descend_y_comp_mm_per_mm").value)
+        self.descend_desired_pixel_u = float(self.get_parameter("descend_desired_pixel_u").value)
+        self.descend_desired_pixel_v = float(self.get_parameter("descend_desired_pixel_v").value)
+        self.descend_pixel_deadband = float(self.get_parameter("descend_pixel_deadband").value)
+        self.descend_pixel_kp_mm_per_px = float(self.get_parameter("descend_pixel_kp_mm_per_px").value)
+        self.descend_pixel_max_xy_step_mm = float(self.get_parameter("descend_pixel_max_xy_step_mm").value)
+        self.descend_pixel_x_sign = float(self.get_parameter("descend_pixel_x_sign").value)
+        self.descend_pixel_y_sign = float(self.get_parameter("descend_pixel_y_sign").value)
         self.descend_min_z_mm = float(self.get_parameter("descend_min_z_mm").value)
         self.descend_min_confidence = float(self.get_parameter("descend_min_confidence").value)
         self.descend_speed = float(self.get_parameter("descend_speed").value)
@@ -545,7 +561,7 @@ class VisualServoTaskNode(Node):
         执行视觉守护下降：
         - 每次只下降 descend_step_mm
         - 下降前检查目标新鲜度、置信度和像素安全区域
-        - 允许小幅 XY 修正，尽量让红块留在视野中
+        - pixel 模式下先用图像误差做小步 XY 修正，目标回到中心附近才下降
         """
         if not self.arm_state_is_fresh():
             self.get_logger().warn("没有新的机械臂状态，等待下降。")
@@ -578,7 +594,22 @@ class VisualServoTaskNode(Node):
             self.last_command_time = time.time()
             return
 
-        step_z_mm = min(self.descend_step_mm, remaining_mm)
+        pixel = self.latest_target.get("pixel", {})
+        try:
+            pixel_u = float(pixel["x"])
+            pixel_v = float(pixel["y"])
+        except Exception:
+            self.get_logger().error("下降阶段像素信息无效，停止下降。")
+            self.enter_state("FAIL")
+            self.publish_state({"error": "descend_bad_pixel"})
+            return
+
+        err_u = self.descend_desired_pixel_u - pixel_u
+        err_v = self.descend_desired_pixel_v - pixel_v
+        pixel_err = math.hypot(err_u, err_v)
+        center_ok = pixel_err <= self.descend_pixel_deadband
+
+        step_z_mm = min(self.descend_step_mm, remaining_mm) if center_ok else 0.0
         target_z = pose["z"] - step_z_mm
 
         # 检查安全限制
@@ -600,7 +631,16 @@ class VisualServoTaskNode(Node):
         compensate_x = self.descend_x_comp_mm_per_mm * (self.descend_done_mm + step_z_mm)
         compensate_y = self.descend_y_comp_mm_per_mm * (self.descend_done_mm + step_z_mm)
 
-        if self.descend_lock_xy:
+        if self.descend_control_mode == "pixel":
+            dx = self.descend_pixel_x_sign * self.descend_pixel_kp_mm_per_px * err_u
+            dy = self.descend_pixel_y_sign * self.descend_pixel_kp_mm_per_px * err_v
+            dx = self.limit_delta(dx, self.descend_pixel_max_xy_step_mm)
+            dy = self.limit_delta(dy, self.descend_pixel_max_xy_step_mm)
+
+            target_x = pose["x"] + dx + compensate_x
+            target_y = pose["y"] + dy + compensate_y
+
+        elif self.descend_lock_xy:
             target_x = anchor_pose["x"] + compensate_x
             target_y = anchor_pose["y"] + compensate_y
         else:
@@ -634,10 +674,11 @@ class VisualServoTaskNode(Node):
             return
 
         confidence = float(self.latest_target.get("confidence", 0.0))
-        pixel = self.latest_target.get("pixel", {})
         self.get_logger().info(
             f"视觉守护下降：done={self.descend_done_mm:.1f}/{self.descend_test_mm:.1f} mm "
-            f"conf={confidence:.2f} pixel=({float(pixel.get('x', -1)):.1f},{float(pixel.get('y', -1)):.1f}) "
+            f"mode={self.descend_control_mode} conf={confidence:.2f} "
+            f"pixel=({pixel_u:.1f},{pixel_v:.1f}) err=({err_u:.1f},{err_v:.1f}) "
+            f"center_ok={center_ok} "
             f"current=({pose['x']:.1f},{pose['y']:.1f},{pose['z']:.1f}) "
             f"target=({descend_target['x']:.1f},{descend_target['y']:.1f},{descend_target['z']:.1f})"
         )
