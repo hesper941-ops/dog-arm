@@ -2,6 +2,7 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -13,6 +14,7 @@ def generate_launch_description():
     show_window = LaunchConfiguration("show_window")
     enable_pick_place_sequence = LaunchConfiguration("enable_pick_place_sequence")
     servo_min_z_mm = LaunchConfiguration("servo_min_z_mm")
+    enable_execution_logger = LaunchConfiguration("enable_execution_logger")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -38,6 +40,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "servo_min_z_mm",
             default_value="110.0",
+        ),
+        DeclareLaunchArgument(
+            "enable_execution_logger",
+            default_value="true",
         ),
 
         Node(
@@ -118,6 +124,12 @@ def generate_launch_description():
                     "edge_step_mm": 12.0,
                     "move_speed": 0.10,
                     "step_wait_s": 2.0,
+                    "adaptive_step_enabled": True,
+                    "adaptive_step_min_mm": 5.0,
+                    "adaptive_step_max_mm": 25.0,
+                    "adaptive_edge_step_min_mm": 5.0,
+                    "adaptive_center_good_ratio": 0.25,
+                    "adaptive_center_bad_ratio": 0.55,
 
                     "enable_e_pixel_servo": False,
 
@@ -181,6 +193,19 @@ def generate_launch_description():
                     "place_z_mm": 120.0,
                     "place_speed": 0.10,
                     "place_wait_s": 2.0,
+                }
+            ],
+        ),
+
+        Node(
+            package="red_block_grasp_ros2",
+            executable="execution_logger_node",
+            name="execution_logger_node",
+            output="screen",
+            condition=IfCondition(enable_execution_logger),
+            parameters=[
+                {
+                    "record_dir": "/home/sunrise/dog/ros2_red_block_ws/run_records",
                 }
             ],
         ),

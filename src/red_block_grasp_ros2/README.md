@@ -62,6 +62,27 @@
 
 视觉闭环任务节点，负责根据目标位置小步控制机械臂运动，并执行下降测试。
 
+### execution_logger_node
+
+轻量运行记录节点，用于保存现场执行数据，方便后续分析视觉闭环行为。
+
+订阅：
+
+- `/roarm_m3/state`
+- `/red_block/target_base`
+- `/red_block/visual_servo_state`
+- `/roarm_m3/cmd`
+
+记录目录：
+
+    /home/sunrise/dog/ros2_red_block_ws/run_records
+
+文件名格式：
+
+    run_YYYYMMDD_HHMMSS.jsonl
+
+每行包含当前时间、最新机械臂状态、最新目标、最新视觉伺服状态和最新命令。
+
 #### 状态机流程
 
 ```
@@ -134,6 +155,19 @@ DONE (完成，发布 reached_descend_test 或 picked_and_placed)
 - `place_speed`: 移动到放置点速度，默认 0.10
 - `place_wait_s`: 到达放置点后等待时间，默认 2.0 s
 
+#### 轻量自适应步长
+
+视觉闭环阶段支持轻量化自适应步长。它不是强化学习，也不会在线训练模型；只是根据目标像素距离图像中心的程度，在运行时调整本次 `move_pose` 的步长。
+
+- `adaptive_step_enabled`: 是否启用自适应步长，默认 true
+- `adaptive_step_min_mm`: 目标偏离中心时的最小普通步长，默认 5.0 mm
+- `adaptive_step_max_mm`: 目标靠近中心时允许的最大普通步长，默认 25.0 mm
+- `adaptive_edge_step_min_mm`: 目标靠近安全 ROI 边缘时的最小步长，默认 5.0 mm
+- `adaptive_center_good_ratio`: 认为目标足够居中的归一化距离，默认 0.25
+- `adaptive_center_bad_ratio`: 认为目标偏离较大的归一化距离，默认 0.55
+
+如果上一步后目标丢失，下一次视觉闭环步长会临时乘以 0.6，然后恢复正常自适应计算。
+
 #### 安全保护
 
 - 视觉闭环阶段目标 z 不低于 `servo_min_z_mm`
@@ -166,6 +200,10 @@ DONE (完成，发布 reached_descend_test 或 picked_and_placed)
     cd /home/sunrise/dog/ros2_red_block_ws
     source source_red_block.sh
     ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py
+
+默认会启动 `execution_logger_node` 并记录运行数据。临时关闭运行记录：
+
+    ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py enable_execution_logger:=false
 
 启用下降后的抓取、抬升、放置流程：
 

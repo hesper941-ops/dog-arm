@@ -62,6 +62,12 @@ class VisualServoTaskNode(Node):
         self.declare_parameter("edge_step_mm", 12.0)
         self.declare_parameter("move_speed", 0.10)
         self.declare_parameter("step_wait_s", 2.0)
+        self.declare_parameter("adaptive_step_enabled", True)
+        self.declare_parameter("adaptive_step_min_mm", 5.0)
+        self.declare_parameter("adaptive_step_max_mm", 25.0)
+        self.declare_parameter("adaptive_edge_step_min_mm", 5.0)
+        self.declare_parameter("adaptive_center_good_ratio", 0.25)
+        self.declare_parameter("adaptive_center_bad_ratio", 0.55)
 
         # ===== E 关节视野保持 =====
         # 如果红块在图像上下方向偏离目标像素点，就优先微调 e 关节，避免目标跑出视野。
@@ -169,6 +175,12 @@ class VisualServoTaskNode(Node):
         self.edge_step_mm = float(self.get_parameter("edge_step_mm").value)
         self.move_speed = float(self.get_parameter("move_speed").value)
         self.step_wait_s = float(self.get_parameter("step_wait_s").value)
+        self.adaptive_step_enabled = self.parse_bool(self.get_parameter("adaptive_step_enabled").value)
+        self.adaptive_step_min_mm = float(self.get_parameter("adaptive_step_min_mm").value)
+        self.adaptive_step_max_mm = float(self.get_parameter("adaptive_step_max_mm").value)
+        self.adaptive_edge_step_min_mm = float(self.get_parameter("adaptive_edge_step_min_mm").value)
+        self.adaptive_center_good_ratio = float(self.get_parameter("adaptive_center_good_ratio").value)
+        self.adaptive_center_bad_ratio = float(self.get_parameter("adaptive_center_bad_ratio").value)
 
         self.enable_e_pixel_servo = self.parse_bool(self.get_parameter("enable_e_pixel_servo").value)
         self.desired_pixel_v = float(self.get_parameter("desired_pixel_v").value)
@@ -280,6 +292,7 @@ class VisualServoTaskNode(Node):
         self.descend_start_z = None
         self.servo_recover_attempts = 0
         self.last_safe_servo_pose = None
+        self.next_step_decay = 1.0
 
         self.timer = self.create_timer(0.2, self.on_timer)
 
@@ -479,6 +492,56 @@ class VisualServoTaskNode(Node):
         y_max = self.image_height * self.safe_roi_y_max_ratio
 
         return x_min <= u <= x_max and y_min <= v <= y_max
+
+    def target_center_ratio(self, target):
+        pixel = target.get("pixel", {})
+        u = float(pixel.get("x", self.image_width / 2))
+        v = float(pixel.get("y", self.image_height / 2))
+
+        du = u - self.image_width / 2.0
+        dv = v - self.image_height / 2.0
+        max_dist = math.hypot(self.image_width / 2.0, self.image_height / 2.0)
+
+        return math.hypot(du, dv) / max(max_dist, 1.0)
+
+    def compute_adaptive_step_mm(self, target, pixel_safe):
+        if not self.adaptive_step_enabled:
+            return self.max_step_mm if pixel_safe else self.edge_step_mm, 1.0, None
+
+        center_ratio = self.target_center_ratio(target)
+        good = self.adaptive_center_good_ratio
+        bad = max(self.adaptive_center_bad_ratio, good + 1e-6)
+
+        if center_ratio <= good:
+            quality = 1.0
+        elif center_ratio >= bad:
+            quality = 0.0
+        else:
+            quality = 1.0 - (center_ratio - good) / (bad - good)
+
+        if pixel_safe:
+            low = self.adaptive_step_min_mm
+            high = min(self.max_step_mm, self.adaptive_step_max_mm)
+        else:
+            low = self.adaptive_edge_step_min_mm
+            high = min(self.edge_step_mm, self.adaptive_step_max_mm)
+
+        step_mm = low + (high - low) * quality
+        decay = self.next_step_decay
+        step_mm *= decay
+        step_mm = self.clamp(step_mm, low, high)
+        self.next_step_decay = 1.0
+
+        info = {
+            "center_ratio": center_ratio,
+            "quality": quality,
+            "decay": decay,
+            "low": low,
+            "high": high,
+            "effective_step_mm": step_mm,
+        }
+
+        return step_mm, quality, info
 
     def build_target_eef(self, target_base):
         target_x = float(target_base["x"]) + self.grasp_offset_x_mm
@@ -972,23 +1035,34 @@ class VisualServoTaskNode(Node):
             return
 
         pixel_safe = self.target_pixel_is_safe(self.latest_target)
+        effective_step_mm, _, adaptive_info = self.compute_adaptive_step_mm(
+            self.latest_target,
+            pixel_safe,
+        )
 
         if pixel_safe:
-            max_step = self.max_step_mm
             label = "visual-servo-step"
         else:
-            max_step = self.edge_step_mm
             label = "edge-safe-step"
 
-        step_target, full_dist = self.compute_step_target(pose, target_eef, max_step)
+        step_target, full_dist = self.compute_step_target(pose, target_eef, effective_step_mm)
         if not pixel_safe and step_target["z"] < pose["z"]:
             step_target["z"] = pose["z"]
+
+        adaptive_text = ""
+        if adaptive_info is not None:
+            adaptive_text = (
+                f" effective_step={adaptive_info['effective_step_mm']:.1f} "
+                f"center_ratio={adaptive_info['center_ratio']:.2f} "
+                f"quality={adaptive_info['quality']:.2f} "
+                f"decay={adaptive_info['decay']:.2f}"
+            )
 
         self.get_logger().info(
             f"{label}: current=({pose['x']:.1f},{pose['y']:.1f},{pose['z']:.1f}) "
             f"target=({target_eef['x']:.1f},{target_eef['y']:.1f},{target_eef['z']:.1f}) "
             f"step=({step_target['x']:.1f},{step_target['y']:.1f},{step_target['z']:.1f}) "
-            f"full_dist={full_dist:.1f} pixel_safe={pixel_safe}"
+            f"full_dist={full_dist:.1f} pixel_safe={pixel_safe}{adaptive_text}"
         )
 
         self.publish_move_pose(step_target, pose, label)
@@ -1054,6 +1128,7 @@ class VisualServoTaskNode(Node):
                     self.enter_state("SERVO_STEP")
                 else:
                     self.get_logger().warn("Target lost after step. Stop and wait/search.")
+                    self.next_step_decay = 0.6
                     self.enter_state("WAIT_TARGET")
             return
 

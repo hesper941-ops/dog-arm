@@ -11,6 +11,7 @@ __pycache__/
 
 # Runtime/debug outputs
 hard_samples/
+run_records/
 runs/
 *.bag
 *.db3
