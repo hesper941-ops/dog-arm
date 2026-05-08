@@ -37,7 +37,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "servo_min_z_mm",
-            default_value="80.0",
+            default_value="110.0",
         ),
 
         Node(
@@ -130,6 +130,8 @@ def generate_launch_description():
                     "grasp_offset_z_mm": 0.0,
                     "min_safe_z_mm": 30.0,
                     "servo_min_z_mm": servo_min_z_mm,
+                    "servo_recover_z_margin_mm": 30.0,
+                    "servo_recover_max_attempts": 3,
 
                     "image_width": 640,
                     "image_height": 480,

@@ -87,6 +87,8 @@ class VisualServoTaskNode(Node):
         self.declare_parameter("grasp_offset_z_mm", 0.0)
         self.declare_parameter("min_safe_z_mm", 30.0)
         self.declare_parameter("servo_min_z_mm", 80.0)
+        self.declare_parameter("servo_recover_z_margin_mm", 30.0)
+        self.declare_parameter("servo_recover_max_attempts", 3)
 
         # ===== 图像安全区域 =====
         # 如果红块中心太靠边，只允许更小步运动，防止冲出视野。
@@ -177,6 +179,8 @@ class VisualServoTaskNode(Node):
         self.grasp_offset_z_mm = float(self.get_parameter("grasp_offset_z_mm").value)
         self.min_safe_z_mm = float(self.get_parameter("min_safe_z_mm").value)
         self.servo_min_z_mm = float(self.get_parameter("servo_min_z_mm").value)
+        self.servo_recover_z_margin_mm = float(self.get_parameter("servo_recover_z_margin_mm").value)
+        self.servo_recover_max_attempts = int(self.get_parameter("servo_recover_max_attempts").value)
 
         self.image_width = int(self.get_parameter("image_width").value)
         self.image_height = int(self.get_parameter("image_height").value)
@@ -252,6 +256,8 @@ class VisualServoTaskNode(Node):
         self.pre_grasp_pose = None
         self.descend_done_mm = 0.0
         self.descend_start_z = None
+        self.servo_recover_attempts = 0
+        self.last_safe_servo_pose = None
 
         self.timer = self.create_timer(0.2, self.on_timer)
 
@@ -655,15 +661,18 @@ class VisualServoTaskNode(Node):
         self.busy = True
 
     def publish_recover_servo_height(self, pose):
+        anchor_pose = self.last_safe_servo_pose if self.last_safe_servo_pose is not None else pose
+        recover_z = self.servo_min_z_mm + self.servo_recover_z_margin_mm
+
         target = {
-            "x": pose["x"],
-            "y": pose["y"],
-            "z": self.servo_min_z_mm,
+            "x": anchor_pose["x"],
+            "y": anchor_pose["y"],
+            "z": recover_z,
         }
 
         self.get_logger().warn(
             f"当前 z={pose['z']:.1f} mm 低于视觉闭环安全高度 "
-            f"{self.servo_min_z_mm:.1f} mm，先原地抬升。"
+            f"{self.servo_min_z_mm:.1f} mm，恢复到 z={recover_z:.1f} mm。"
         )
         self.publish_move_pose(target, pose, "recover-servo-min-z")
         self.last_command_time = time.time()
@@ -864,9 +873,28 @@ class VisualServoTaskNode(Node):
 
         pose = self.get_pose_from_arm_state()
         if pose["z"] < self.servo_min_z_mm:
+            self.servo_recover_attempts += 1
+            if self.servo_recover_attempts > self.servo_recover_max_attempts:
+                self.get_logger().error(
+                    f"连续 {self.servo_recover_attempts} 次恢复高度失败，停止视觉闭环。"
+                )
+                self.enter_state("FAIL")
+                self.publish_state(
+                    {
+                        "error": "servo_recover_failed",
+                        "current_pose": pose,
+                        "servo_min_z_mm": self.servo_min_z_mm,
+                        "recover_attempts": self.servo_recover_attempts,
+                    }
+                )
+                return
+
             self.publish_recover_servo_height(pose)
             self.enter_state("WAIT_AFTER_STEP")
             return
+
+        self.servo_recover_attempts = 0
+        self.last_safe_servo_pose = dict(pose)
 
         target_base = self.latest_target["base_mm"]
         target_eef = self.build_target_eef(target_base)
