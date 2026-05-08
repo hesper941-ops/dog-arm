@@ -68,10 +68,10 @@ def generate_launch_description():
                     "center_weight": 0.25,
                     "base_filter_alpha": 0.55,
 
-                    "save_hard_samples": True,
+                    "save_hard_samples": False,
                     "hard_sample_conf_thres": 0.75,
                     "hard_sample_interval_s": 0.8,
-                    "force_save_samples": True,
+                    "force_save_samples": False,
                     "force_sample_interval_s": 1.5,
                     "hard_sample_dir": "/home/sunrise/dog/ros2_red_block_ws/hard_samples",
 
@@ -108,6 +108,8 @@ def generate_launch_description():
                     "edge_step_mm": 12.0,
                     "move_speed": 0.10,
                     "step_wait_s": 2.0,
+
+                    "enable_e_pixel_servo": False,
 
                     "target_xy_tolerance_mm": 25.0,
                     "target_z_tolerance_mm": 25.0,

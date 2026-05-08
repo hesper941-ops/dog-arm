@@ -317,3 +317,39 @@ openmix hard
 3. 将新版 best.pt 替换或复制到 ROS2 工程 models 目录。
 4. 修改 launch 或模型路径，使用新版 YOLO。
 5. 现场验证红块识别稳定性。
+
+## 开发记录：新版 YOLO 模型现场验证通过
+
+当前已经将 PC 端训练得到的新版 YOLO 模型导入 RDK X5，并在 ROS2 主流程中完成现场验证。
+
+新版模型路径：
+
+/home/sunrise/dog/ros2_red_block_ws/src/red_block_grasp_ros2/models/red_block_yolo11n_v3_mix.pt
+
+当前 launch 已使用新版模型作为默认模型。
+
+验证结果：
+
+- target_localizer_node 能正常加载新版 YOLO 模型。
+- Orbbec RGBD 相机能正常启动。
+- /red_block/target_base 能发布有效目标坐标。
+- visual_servo_task_node 能进入 SERVO_STEP。
+- 机械臂驱动节点能收到 move_pose 命令。
+- 当前流程已经能够完成视觉闭环移动到红块上方。
+- 任务状态能够到达 DONE，即 reached_pre_grasp。
+
+当前已完成的主流程：
+
+识别红块
+→ 计算目标 base 坐标
+→ 视觉闭环小步移动
+→ 到达红块上方预抓取点
+
+下一步任务：
+
+1. 在稳定识别基础上接入下降动作。
+2. 接入闭爪动作。
+3. 接入抬升动作。
+4. 最后再接入放置动作。
+5. 保持分阶段动作，不直接一次性冲到最终抓取点。
+

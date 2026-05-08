@@ -45,10 +45,10 @@ class TargetLocalizerNode(Node):
 
         self.declare_parameter("base_filter_alpha", 0.55)
 
-        self.declare_parameter("save_hard_samples", False)
+        self.declare_parameter("save_hard_samples", True)
         self.declare_parameter("hard_sample_conf_thres", 0.75)
         self.declare_parameter("hard_sample_interval_s", 0.8)
-        self.declare_parameter("force_save_samples", False)
+        self.declare_parameter("force_save_samples", True)
         self.declare_parameter("force_sample_interval_s", 1.5)
         self.declare_parameter("hard_sample_dir", "/home/sunrise/dog/ros2_red_block_ws/hard_samples")
 
