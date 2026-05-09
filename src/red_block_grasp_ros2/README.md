@@ -13,6 +13,7 @@
 - 小步视觉闭环移动到预抓取点
 - 预抓取点安全高度控制
 - 下降测试流程
+- 新增 center-first 视觉伺服策略：先居中再靠近
 - 可选闭爪、抬升、移动到放置点、开爪流程
 - 运行数据 JSONL 记录
 - 轻量化自适应视觉伺服步长
@@ -109,7 +110,9 @@ ros2 launch red_block_grasp_ros2 visual_servo_task.launch.py show_window:=true e
 INIT
 -> WAIT_INITIAL
 -> WAIT_TARGET
--> SERVO_STEP
+-> CENTER_TARGET
+-> WAIT_AFTER_CENTER_STEP
+-> APPROACH_CENTERED
 -> WAIT_AFTER_STEP
 -> REACHED_PRE_GRASP
 -> DESCEND_TEST
@@ -141,9 +144,10 @@ CLOSE_GRIPPER
 - 保留 `check_target_range` 工作空间保护
 - 使用 `servo_min_z_mm` 限制视觉闭环阶段最低高度
 - 当前高度过低时先执行恢复抬升
+- 新增 center-first 视觉伺服策略：先把红块移动到图像中心，再执行高位小步靠近
 - 目标靠近安全 ROI 边缘时使用 `edge-safe-step`
 - 根据目标像素点距离图像中心的程度动态调整本次步长
-- 如果发生 `Target lost after step`，下一次步长临时衰减
+- 如果发生 `Target lost after step`，先恢复到上一次安全高位，再进入 WAIT_TARGET
 
 自适应步长不是强化学习，也不会在线训练模型。它只是根据当前视觉反馈和运行记录做安全的运行时参数自适应。
 

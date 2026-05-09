@@ -96,6 +96,20 @@ class VisualServoTaskNode(Node):
         self.declare_parameter("servo_recover_z_margin_mm", 30.0)
         self.declare_parameter("servo_recover_max_attempts", 3)
 
+        # ===== Center-first visual servo =====
+        self.declare_parameter("enable_center_first_servo", True)
+        self.declare_parameter("center_pixel_u", 320.0)
+        self.declare_parameter("center_pixel_v", 240.0)
+        self.declare_parameter("center_pixel_deadband_u", 40.0)
+        self.declare_parameter("center_pixel_deadband_v", 40.0)
+        self.declare_parameter("center_stable_frames_required", 3)
+        self.declare_parameter("center_b_kp_deg_per_px", 0.018)
+        self.declare_parameter("center_b_max_step_deg", 2.0)
+        self.declare_parameter("center_e_kp_deg_per_px", 0.020)
+        self.declare_parameter("center_e_max_step_deg", 2.0)
+        self.declare_parameter("center_step_wait_s", 1.0)
+        self.declare_parameter("approach_hold_z_mm", 140.0)
+
         # ===== 图像安全区域 =====
         # 如果红块中心太靠边，只允许更小步运动，防止冲出视野。
         self.declare_parameter("image_width", 640)
@@ -205,6 +219,19 @@ class VisualServoTaskNode(Node):
         self.servo_recover_z_margin_mm = float(self.get_parameter("servo_recover_z_margin_mm").value)
         self.servo_recover_max_attempts = int(self.get_parameter("servo_recover_max_attempts").value)
 
+        self.enable_center_first_servo = self.parse_bool(self.get_parameter("enable_center_first_servo").value)
+        self.center_pixel_u = float(self.get_parameter("center_pixel_u").value)
+        self.center_pixel_v = float(self.get_parameter("center_pixel_v").value)
+        self.center_pixel_deadband_u = float(self.get_parameter("center_pixel_deadband_u").value)
+        self.center_pixel_deadband_v = float(self.get_parameter("center_pixel_deadband_v").value)
+        self.center_stable_frames_required = int(self.get_parameter("center_stable_frames_required").value)
+        self.center_b_kp_deg_per_px = float(self.get_parameter("center_b_kp_deg_per_px").value)
+        self.center_b_max_step_deg = float(self.get_parameter("center_b_max_step_deg").value)
+        self.center_e_kp_deg_per_px = float(self.get_parameter("center_e_kp_deg_per_px").value)
+        self.center_e_max_step_deg = float(self.get_parameter("center_e_max_step_deg").value)
+        self.center_step_wait_s = float(self.get_parameter("center_step_wait_s").value)
+        self.approach_hold_z_mm = float(self.get_parameter("approach_hold_z_mm").value)
+
         self.image_width = int(self.get_parameter("image_width").value)
         self.image_height = int(self.get_parameter("image_height").value)
         self.safe_roi_x_min_ratio = float(self.get_parameter("safe_roi_x_min_ratio").value)
@@ -293,6 +320,9 @@ class VisualServoTaskNode(Node):
         self.servo_recover_attempts = 0
         self.last_safe_servo_pose = None
         self.next_step_decay = 1.0
+        self.center_stable_frames = 0
+        self.recovering_after_lost = False
+        self.last_move_origin = None
 
         self.timer = self.create_timer(0.2, self.on_timer)
 
@@ -904,6 +934,59 @@ class VisualServoTaskNode(Node):
 
         return e_value
 
+    def get_current_joint_deg(self, keys, default=0.0):
+        if self.latest_arm_state is None:
+            return None
+
+        for key in keys:
+            if key not in self.latest_arm_state:
+                continue
+            try:
+                value = float(self.latest_arm_state[key])
+            except Exception:
+                continue
+
+            if abs(value) <= 6.5:
+                return math.degrees(value)
+
+            return value
+
+        return float(default)
+
+    def publish_b_joint_correction(self, target_b_deg, reason):
+        cmd = {
+            "type": "move_joint",
+            "joint": 1,
+            "angle": float(target_b_deg),
+            "speed": self.e_servo_speed_deg_s,
+            "acc": self.e_servo_acc,
+            "label": reason,
+        }
+        self.publish_cmd(cmd)
+
+    def target_centered(self, target):
+        pixel = target.get("pixel", {})
+        try:
+            u = float(pixel.get("x", self.center_pixel_u))
+            v = float(pixel.get("y", self.center_pixel_v))
+        except Exception:
+            return False
+
+        return (
+            abs(u - self.center_pixel_u) <= self.center_pixel_deadband_u
+            and abs(v - self.center_pixel_v) <= self.center_pixel_deadband_v
+        )
+
+    def get_target_center_errors(self, target):
+        pixel = target.get("pixel", {})
+        try:
+            u = float(pixel.get("x", self.center_pixel_u))
+            v = float(pixel.get("y", self.center_pixel_v))
+        except Exception:
+            return None, None
+
+        return self.center_pixel_u - u, self.center_pixel_v - v
+
     @staticmethod
     def clamp(value, low, high):
         return max(low, min(high, value))
@@ -964,7 +1047,7 @@ class VisualServoTaskNode(Node):
 
         return True, info
 
-    def do_visual_servo_step(self):
+    def do_visual_servo_step(self, fixed_z=None):
         if not self.target_is_fresh():
             self.enter_state("WAIT_TARGET")
             return
@@ -985,36 +1068,43 @@ class VisualServoTaskNode(Node):
             self.publish_e_joint_correction(e_info["target_e_deg"], "e-pixel-servo")
             self.last_command_time = time.time()
             self.busy = True
+            self.last_move_origin = "SERVO_STEP"
             self.enter_state("WAIT_AFTER_STEP")
             return
 
         pose = self.get_pose_from_arm_state()
-        if pose["z"] < self.servo_min_z_mm:
-            self.servo_recover_attempts += 1
-            if self.servo_recover_attempts > self.servo_recover_max_attempts:
-                self.get_logger().error(
-                    f"连续 {self.servo_recover_attempts} 次恢复高度失败，停止视觉闭环。"
-                )
-                self.enter_state("FAIL")
-                self.publish_state(
-                    {
-                        "error": "servo_recover_failed",
-                        "current_pose": pose,
-                        "servo_min_z_mm": self.servo_min_z_mm,
-                        "recover_attempts": self.servo_recover_attempts,
-                    }
-                )
+        if fixed_z is None:
+            if pose["z"] < self.servo_min_z_mm:
+                self.servo_recover_attempts += 1
+                if self.servo_recover_attempts > self.servo_recover_max_attempts:
+                    self.get_logger().error(
+                        f"连续 {self.servo_recover_attempts} 次恢复高度失败，停止视觉闭环。"
+                    )
+                    self.enter_state("FAIL")
+                    self.publish_state(
+                        {
+                            "error": "servo_recover_failed",
+                            "current_pose": pose,
+                            "servo_min_z_mm": self.servo_min_z_mm,
+                            "recover_attempts": self.servo_recover_attempts,
+                        }
+                    )
+                    return
+
+                self.publish_recover_servo_height(pose)
+                self.last_move_origin = "SERVO_STEP"
+                self.enter_state("WAIT_AFTER_STEP")
                 return
 
-            self.publish_recover_servo_height(pose)
-            self.enter_state("WAIT_AFTER_STEP")
-            return
-
-        self.servo_recover_attempts = 0
-        self.last_safe_servo_pose = dict(pose)
+            self.servo_recover_attempts = 0
+            self.last_safe_servo_pose = dict(pose)
+        else:
+            self.servo_recover_attempts = 0
 
         target_base = self.latest_target["base_mm"]
         target_eef = self.build_target_eef(target_base)
+        if fixed_z is not None:
+            target_eef["z"] = max(fixed_z, self.servo_min_z_mm)
 
         xy_error = self.dist_xy(pose, target_eef)
         z_error = abs(pose["z"] - target_eef["z"])
@@ -1040,13 +1130,15 @@ class VisualServoTaskNode(Node):
             pixel_safe,
         )
 
-        if pixel_safe:
+        if fixed_z is not None:
+            label = "approach-centered-step"
+        elif pixel_safe:
             label = "visual-servo-step"
         else:
             label = "edge-safe-step"
 
         step_target, full_dist = self.compute_step_target(pose, target_eef, effective_step_mm)
-        if not pixel_safe and step_target["z"] < pose["z"]:
+        if fixed_z is None and not pixel_safe and step_target["z"] < pose["z"]:
             step_target["z"] = pose["z"]
 
         adaptive_text = ""
@@ -1068,7 +1160,121 @@ class VisualServoTaskNode(Node):
         self.publish_move_pose(step_target, pose, label)
         self.last_command_time = time.time()
         self.busy = True
+        self.last_move_origin = "APPROACH_CENTERED" if fixed_z is not None else "SERVO_STEP"
         self.enter_state("WAIT_AFTER_STEP")
+
+    def do_center_target(self):
+        if not self.target_is_fresh():
+            self.get_logger().warn("Center target: target not fresh, wait target.")
+            self.center_stable_frames = 0
+            self.enter_state("WAIT_TARGET")
+            return
+
+        if not self.arm_state_is_fresh():
+            self.get_logger().warn("Center target: no fresh arm state.")
+            return
+
+        if self.latest_target is None:
+            self.center_stable_frames = 0
+            self.enter_state("WAIT_TARGET")
+            return
+
+        pixel = self.latest_target.get("pixel", None)
+        if not isinstance(pixel, dict):
+            self.center_stable_frames = 0
+            self.enter_state("WAIT_TARGET")
+            return
+
+        confidence = float(self.latest_target.get("confidence", 0.0))
+        if confidence < 0.40:
+            self.get_logger().warn(
+                f"Center target: low confidence {confidence:.2f}, wait target."
+            )
+            self.center_stable_frames = 0
+            self.enter_state("WAIT_TARGET")
+            return
+
+        if self.target_centered(self.latest_target):
+            self.center_stable_frames += 1
+            self.get_logger().info(
+                f"Center target stable {self.center_stable_frames}/{self.center_stable_frames_required}."
+            )
+            if self.center_stable_frames >= self.center_stable_frames_required:
+                self.center_stable_frames = 0
+                self.get_logger().info("Target centered. Enter APPROACH_CENTERED.")
+                self.enter_state("APPROACH_CENTERED")
+                return
+
+            self.last_command_time = time.time()
+            self.busy = False
+            self.last_move_origin = "CENTER_TARGET"
+            self.enter_state("WAIT_AFTER_CENTER_STEP")
+            return
+
+        self.center_stable_frames = 0
+        err_u, err_v = self.get_target_center_errors(self.latest_target)
+        if err_u is None or err_v is None:
+            self.center_stable_frames = 0
+            self.enter_state("WAIT_TARGET")
+            return
+
+        move_b = abs(err_u) > self.center_pixel_deadband_u
+        move_e = abs(err_v) > self.center_pixel_deadband_v
+
+        if not move_b and not move_e:
+            self.last_command_time = time.time()
+            self.busy = False
+            self.last_move_origin = "CENTER_TARGET"
+            self.enter_state("WAIT_AFTER_CENTER_STEP")
+            return
+
+        current_b_deg = self.get_current_joint_deg(["b", "pose_b", "tool_b", "bia"], default=0.0)
+        current_e_deg = self.get_current_e_deg()
+        if current_e_deg is None:
+            self.get_logger().warn("Center target: no current E angle.")
+            return
+
+        delta_b = self.center_b_kp_deg_per_px * err_u
+        delta_b = self.clamp(delta_b, -self.center_b_max_step_deg, self.center_b_max_step_deg)
+        target_b = self.clamp(current_b_deg + delta_b, -180.0, 180.0)
+
+        delta_e = self.center_e_kp_deg_per_px * err_v
+        delta_e = self.clamp(delta_e, -self.center_e_max_step_deg, self.center_e_max_step_deg)
+        target_e = self.clamp(current_e_deg + delta_e, self.e_min_deg, self.e_max_deg)
+
+        if move_b and (not move_e or abs(err_u) >= abs(err_v)):
+            self.get_logger().info(
+                f"Center target adjust B: err_u={err_u:.1f}, current_b={current_b_deg:.1f} -> target_b={target_b:.1f}"
+            )
+            self.publish_b_joint_correction(target_b, "center-b-servo")
+        else:
+            self.get_logger().info(
+                f"Center target adjust E: err_v={err_v:.1f}, current_e={current_e_deg:.1f} -> target_e={target_e:.1f}"
+            )
+            self.publish_e_joint_correction(target_e, "center-e-servo")
+
+        self.last_command_time = time.time()
+        self.busy = True
+        self.last_move_origin = "CENTER_TARGET"
+        self.enter_state("WAIT_AFTER_CENTER_STEP")
+
+    def do_approach_centered_step(self):
+        if not self.target_is_fresh():
+            self.get_logger().warn("Approach centered: target not fresh, wait target.")
+            self.enter_state("WAIT_TARGET")
+            return
+
+        if not self.arm_state_is_fresh():
+            self.get_logger().warn("Approach centered: no fresh arm state.")
+            return
+
+        if not self.target_centered(self.latest_target):
+            self.get_logger().info("Approach centered: target moved off center, return to CENTER_TARGET.")
+            self.enter_state("CENTER_TARGET")
+            return
+
+        hold_z = max(self.approach_hold_z_mm, self.servo_min_z_mm)
+        self.do_visual_servo_step(fixed_z=hold_z)
 
     def on_timer(self):
         self.publish_state()
@@ -1098,7 +1304,10 @@ class VisualServoTaskNode(Node):
                 return
 
             if self.target_is_fresh():
-                self.enter_state("SERVO_STEP")
+                if self.enable_center_first_servo:
+                    self.enter_state("CENTER_TARGET")
+                else:
+                    self.enter_state("SERVO_STEP")
                 return
 
             if self.enable_b_scan and now - self.last_scan_switch_time > self.scan_timeout_s:
@@ -1116,20 +1325,54 @@ class VisualServoTaskNode(Node):
                 self.enter_state("WAIT_INITIAL")
                 return
 
+        if self.state == "CENTER_TARGET":
+            self.do_center_target()
+            return
+
+        if self.state == "WAIT_AFTER_CENTER_STEP":
+            if now - self.last_command_time >= self.center_step_wait_s:
+                self.busy = False
+                self.enter_state("CENTER_TARGET")
+            return
+
         if self.state == "SERVO_STEP":
             self.do_visual_servo_step()
+            return
+
+        if self.state == "APPROACH_CENTERED":
+            self.do_approach_centered_step()
             return
 
         if self.state == "WAIT_AFTER_STEP":
             if now - self.last_command_time >= self.step_wait_s:
                 self.busy = False
 
-                if self.target_is_fresh():
-                    self.enter_state("SERVO_STEP")
-                else:
-                    self.get_logger().warn("Target lost after step. Stop and wait/search.")
-                    self.next_step_decay = 0.6
+                if self.recovering_after_lost:
+                    self.recovering_after_lost = False
+                    self.get_logger().info("Recovered to safe pose after target loss. Enter WAIT_TARGET.")
                     self.enter_state("WAIT_TARGET")
+                    return
+
+                if not self.target_is_fresh():
+                    self.get_logger().warn("Target lost after step. Recover and wait/search.")
+                    self.next_step_decay = 0.6
+                    if self.last_safe_servo_pose is not None and self.arm_state_is_fresh():
+                        self.publish_recover_servo_height(self.get_pose_from_arm_state())
+                        self.recovering_after_lost = True
+                        return
+                    self.enter_state("WAIT_TARGET")
+                    return
+
+                if self.enable_center_first_servo and self.last_move_origin == "APPROACH_CENTERED":
+                    if not self.target_centered(self.latest_target):
+                        self.get_logger().info(
+                            "Target moved off center after approach step, return to CENTER_TARGET."
+                        )
+                        self.enter_state("CENTER_TARGET")
+                    else:
+                        self.enter_state("APPROACH_CENTERED")
+                else:
+                    self.enter_state("SERVO_STEP")
             return
 
         if self.state == "REACHED_PRE_GRASP":
