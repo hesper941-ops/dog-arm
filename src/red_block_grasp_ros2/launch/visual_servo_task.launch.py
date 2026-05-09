@@ -177,6 +177,8 @@ def generate_launch_description():
                     "center_b_max_step_deg": 2.0,
                     "center_e_kp_deg_per_px": 0.020,
                     "center_e_max_step_deg": 2.0,
+                    "center_b_pixel_sign": 1.0,
+                    "center_e_pixel_sign": -1.0,
                     "center_step_wait_s": 1.0,
                     "approach_hold_z_mm": 140.0,
 

@@ -11,7 +11,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-
+#这是一个轻量级的执行日志记录器，适用于实地运行。它监听主要的运行时主题，并写入紧凑的JSONL快照。
 class ExecutionLoggerNode(Node):
     def __init__(self):
         super().__init__("execution_logger_node")

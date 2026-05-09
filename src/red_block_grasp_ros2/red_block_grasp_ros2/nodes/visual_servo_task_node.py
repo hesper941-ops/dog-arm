@@ -107,6 +107,8 @@ class VisualServoTaskNode(Node):
         self.declare_parameter("center_b_max_step_deg", 2.0)
         self.declare_parameter("center_e_kp_deg_per_px", 0.020)
         self.declare_parameter("center_e_max_step_deg", 2.0)
+        self.declare_parameter("center_b_pixel_sign", 1.0)
+        self.declare_parameter("center_e_pixel_sign", -1.0)
         self.declare_parameter("center_step_wait_s", 1.0)
         self.declare_parameter("approach_hold_z_mm", 140.0)
 
@@ -229,6 +231,8 @@ class VisualServoTaskNode(Node):
         self.center_b_max_step_deg = float(self.get_parameter("center_b_max_step_deg").value)
         self.center_e_kp_deg_per_px = float(self.get_parameter("center_e_kp_deg_per_px").value)
         self.center_e_max_step_deg = float(self.get_parameter("center_e_max_step_deg").value)
+        self.center_b_pixel_sign = float(self.get_parameter("center_b_pixel_sign").value)
+        self.center_e_pixel_sign = float(self.get_parameter("center_e_pixel_sign").value)
         self.center_step_wait_s = float(self.get_parameter("center_step_wait_s").value)
         self.approach_hold_z_mm = float(self.get_parameter("approach_hold_z_mm").value)
 
@@ -1234,22 +1238,24 @@ class VisualServoTaskNode(Node):
             self.get_logger().warn("Center target: no current E angle.")
             return
 
-        delta_b = self.center_b_kp_deg_per_px * err_u
+        delta_b = self.center_b_pixel_sign * self.center_b_kp_deg_per_px * err_u
         delta_b = self.clamp(delta_b, -self.center_b_max_step_deg, self.center_b_max_step_deg)
         target_b = self.clamp(current_b_deg + delta_b, -180.0, 180.0)
 
-        delta_e = self.center_e_kp_deg_per_px * err_v
+        delta_e = self.center_e_pixel_sign * self.center_e_kp_deg_per_px * err_v
         delta_e = self.clamp(delta_e, -self.center_e_max_step_deg, self.center_e_max_step_deg)
         target_e = self.clamp(current_e_deg + delta_e, self.e_min_deg, self.e_max_deg)
 
         if move_b and (not move_e or abs(err_u) >= abs(err_v)):
             self.get_logger().info(
-                f"Center target adjust B: err_u={err_u:.1f}, current_b={current_b_deg:.1f} -> target_b={target_b:.1f}"
+                f"Center target adjust B: err_u={err_u:.1f}, b_sign={self.center_b_pixel_sign:.1f}, "
+                f"delta_b={delta_b:.2f}, current_b={current_b_deg:.1f} -> target_b={target_b:.1f}"
             )
             self.publish_b_joint_correction(target_b, "center-b-servo")
         else:
             self.get_logger().info(
-                f"Center target adjust E: err_v={err_v:.1f}, current_e={current_e_deg:.1f} -> target_e={target_e:.1f}"
+                f"Center target adjust E: err_v={err_v:.1f}, e_sign={self.center_e_pixel_sign:.1f}, "
+                f"delta_e={delta_e:.2f}, current_e={current_e_deg:.1f} -> target_e={target_e:.1f}"
             )
             self.publish_e_joint_correction(target_e, "center-e-servo")
 

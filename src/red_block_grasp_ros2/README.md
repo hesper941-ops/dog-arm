@@ -145,6 +145,7 @@ CLOSE_GRIPPER
 - 使用 `servo_min_z_mm` 限制视觉闭环阶段最低高度
 - 当前高度过低时先执行恢复抬升
 - 新增 center-first 视觉伺服策略：先把红块移动到图像中心，再执行高位小步靠近
+- 修复 CENTER_TARGET 阶段 E 关节像素居中方向：新增 `center_e_pixel_sign`（默认 -1.0）和 `center_b_pixel_sign`（默认 1.0），用于校正 B/E 关节调整方向与像素偏移之间的符号关系。如果目标在图像中偏离中心但 E 关节调整后反而更远，优先翻转对应 sign 参数。
 - 目标靠近安全 ROI 边缘时使用 `edge-safe-step`
 - 根据目标像素点距离图像中心的程度动态调整本次步长
 - 如果发生 `Target lost after step`，先恢复到上一次安全高位，再进入 WAIT_TARGET
