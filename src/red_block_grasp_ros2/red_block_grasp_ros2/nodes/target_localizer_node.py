@@ -552,7 +552,7 @@ class TargetLocalizerNode(Node):
             cv2.rectangle(display, (det.x1, det.y1), (det.x2, det.y2), color, 3 if is_selected else 2)
             cv2.circle(display, det.center, 5, color, -1)
 
-        if selected is not None and selected not in color_detections:
+        if selected is not None and all(selected is not det for det in color_detections):
             cv2.rectangle(display, (selected.x1, selected.y1), (selected.x2, selected.y2), (0, 255, 255), 3)
             cv2.circle(display, selected.center, 5, (0, 255, 255), -1)
 
