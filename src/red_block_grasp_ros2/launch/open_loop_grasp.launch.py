@@ -120,6 +120,8 @@ def generate_launch_description():
                         "max_pre_grasp_segments": 3,
                         "motion_timeout_s": 8.0,
                         "motion_wait_s": 1.5,
+                        "motion_min_wait_s": 0.8,
+                        "position_reached_tolerance_mm": 25.0,
                         "settle_time_s": 0.3,
                         "max_retarget_drift_mm": 60.0,
                         "final_correction_enabled": True,

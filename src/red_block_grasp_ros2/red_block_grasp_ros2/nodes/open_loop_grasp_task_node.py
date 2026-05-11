@@ -51,6 +51,8 @@ class OpenLoopGraspTaskNode(Node):
 
         self.declare_parameter("motion_timeout_s", 8.0)
         self.declare_parameter("motion_wait_s", 1.5)
+        self.declare_parameter("motion_min_wait_s", 0.8)
+        self.declare_parameter("position_reached_tolerance_mm", 25.0)
         self.declare_parameter("settle_time_s", 0.3)
         self.declare_parameter("pose_t_rad", "none")
         self.declare_parameter("pose_r_rad", "none")
@@ -101,6 +103,8 @@ class OpenLoopGraspTaskNode(Node):
 
         self.motion_timeout_s = float(self.get_parameter("motion_timeout_s").value)
         self.motion_wait_s = float(self.get_parameter("motion_wait_s").value)
+        self.motion_min_wait_s = float(self.get_parameter("motion_min_wait_s").value)
+        self.position_reached_tolerance_mm = float(self.get_parameter("position_reached_tolerance_mm").value)
         self.settle_time_s = float(self.get_parameter("settle_time_s").value)
         self.pose_t_rad = self.optional_float(self.get_parameter("pose_t_rad").value)
         self.pose_r_rad = self.optional_float(self.get_parameter("pose_r_rad").value)
@@ -386,11 +390,31 @@ class OpenLoopGraspTaskNode(Node):
             )
         return segments
 
+    def motion_min_wait_done(self):
+        return time.time() - self.last_command_time >= self.motion_min_wait_s
+
     def motion_wait_done(self):
-        return time.time() - self.last_command_time >= self.motion_wait_s
+        return self.motion_min_wait_done()
+
+    def motion_reached(self):
+        if not isinstance(self.current_goal, dict):
+            return False
+        if any(key not in self.current_goal for key in ("x", "y", "z")):
+            return False
+        if not self.arm_state_is_fresh():
+            return False
+
+        pose = self.get_pose_from_arm_state()
+        if pose is None:
+            return False
+        distance = self.dist3(pose, self.current_goal)
+        return distance <= self.position_reached_tolerance_mm
 
     def motion_timed_out(self):
         return time.time() - self.last_command_time >= self.motion_timeout_s
+
+    def pose_motion_done(self):
+        return self.motion_min_wait_done() and self.motion_reached()
 
     def send_gripper(self, angle, label):
         self.current_goal = {"joint": 6, "angle": float(angle)}
@@ -457,7 +481,7 @@ class OpenLoopGraspTaskNode(Node):
                     return
                 self.publish_cmd(cmd)
                 return
-            if self.state_command_sent and self.motion_wait_done():
+            if self.state_command_sent and self.pose_motion_done():
                 self.pre_grasp_segment_index += 1
                 self.state_command_sent = False
                 if self.pre_grasp_segment_index >= len(self.pre_grasp_segments):
@@ -512,7 +536,7 @@ class OpenLoopGraspTaskNode(Node):
                     return
                 self.publish_cmd(cmd)
                 return
-            if self.motion_wait_done():
+            if self.pose_motion_done():
                 self.enter_state("CLOSE_GRIPPER")
             elif self.motion_timed_out():
                 self.fail("grasp_motion_timeout")
@@ -537,7 +561,7 @@ class OpenLoopGraspTaskNode(Node):
                     return
                 self.publish_cmd(cmd)
                 return
-            if self.motion_wait_done():
+            if self.pose_motion_done():
                 self.enter_state("MOVE_RETREAT")
             elif self.motion_timed_out():
                 self.fail("lift_motion_timeout")
@@ -552,7 +576,7 @@ class OpenLoopGraspTaskNode(Node):
                     return
                 self.publish_cmd(cmd)
                 return
-            if self.motion_wait_done():
+            if self.pose_motion_done():
                 self.done = True
                 self.enter_state("DONE")
             elif self.motion_timed_out():
@@ -581,19 +605,29 @@ class OpenLoopGraspTaskNode(Node):
                 if cmd is not None:
                     self.publish_cmd(cmd)
                 return
-            if self.recover_step == 1 and self.motion_wait_done():
+            if self.recover_step == 1 and self.pose_motion_done():
                 self.recover_step = 2
                 self.state_command_sent = False
+                return
+            if self.recover_step == 1 and self.motion_timed_out():
+                self.target_window.clear()
+                self.latest_target = None
+                self.enter_state("IDLE", "recover lift timed out")
                 return
             if self.recover_step == 2 and not self.state_command_sent:
                 cmd = self.pose_cmd(self.safe_pose, self.retreat_move_speed, "recover-retreat-safe")
                 if cmd is not None:
                     self.publish_cmd(cmd)
                 return
-            if self.recover_step == 2 and self.motion_wait_done():
+            if self.recover_step == 2 and self.pose_motion_done():
                 self.target_window.clear()
                 self.latest_target = None
                 self.enter_state("IDLE")
+                return
+            if self.recover_step == 2 and self.motion_timed_out():
+                self.target_window.clear()
+                self.latest_target = None
+                self.enter_state("IDLE", "recover retreat timed out")
 
 
 def main(args=None):

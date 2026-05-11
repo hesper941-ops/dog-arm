@@ -90,37 +90,37 @@ class TargetLocalizerNode(Node):
         self.infer_imgsz = int(self.get_parameter("infer_imgsz").value)
         self.max_targets = int(self.get_parameter("max_targets").value)
         self.timer_period = float(self.get_parameter("timer_period").value)
-        self.show_window = bool(self.get_parameter("show_window").value)
+        self.show_window = self.parse_bool(self.get_parameter("show_window").value)
         self.display_scale = float(self.get_parameter("display_scale").value)
         self.detector_device = str(self.get_parameter("detector_device").value)
-        self.detector_half = bool(self.get_parameter("detector_half").value)
+        self.detector_half = self.parse_bool(self.get_parameter("detector_half").value)
         self.perf_log_interval_s = float(self.get_parameter("perf_log_interval_s").value)
 
         self.detector_mode = str(self.get_parameter("detector_mode").value).strip().lower()
         if self.detector_mode not in ("yolo", "color", "fusion"):
             self.detector_mode = "fusion"
         self.yolo_every_n_frames = max(1, int(self.get_parameter("yolo_every_n_frames").value))
-        self.enable_color_detector = bool(self.get_parameter("enable_color_detector").value)
-        self.enable_yolo_detector = bool(self.get_parameter("enable_yolo_detector").value)
+        self.enable_color_detector = self.parse_bool(self.get_parameter("enable_color_detector").value)
+        self.enable_yolo_detector = self.parse_bool(self.get_parameter("enable_yolo_detector").value)
         self.fusion_iou_threshold = float(self.get_parameter("fusion_iou_threshold").value)
         self.stable_frame_count = max(1, int(self.get_parameter("stable_frame_count").value))
         self.stable_position_threshold_mm = float(self.get_parameter("stable_position_threshold_mm").value)
         self.stable_depth_threshold_mm = float(self.get_parameter("stable_depth_threshold_mm").value)
-        self.publish_only_stable = bool(self.get_parameter("publish_only_stable").value)
+        self.publish_only_stable = self.parse_bool(self.get_parameter("publish_only_stable").value)
 
         self.safe_roi_x_min_ratio = float(self.get_parameter("safe_roi_x_min_ratio").value)
         self.safe_roi_x_max_ratio = float(self.get_parameter("safe_roi_x_max_ratio").value)
         self.safe_roi_y_min_ratio = float(self.get_parameter("safe_roi_y_min_ratio").value)
         self.safe_roi_y_max_ratio = float(self.get_parameter("safe_roi_y_max_ratio").value)
-        self.enable_target_lock = bool(self.get_parameter("enable_target_lock").value)
+        self.enable_target_lock = self.parse_bool(self.get_parameter("enable_target_lock").value)
         self.lock_max_pixel_jump = float(self.get_parameter("lock_max_pixel_jump").value)
         self.center_weight = float(self.get_parameter("center_weight").value)
         self.base_filter_alpha = float(self.get_parameter("base_filter_alpha").value)
 
-        self.save_hard_samples = bool(self.get_parameter("save_hard_samples").value)
+        self.save_hard_samples = self.parse_bool(self.get_parameter("save_hard_samples").value)
         self.hard_sample_conf_thres = float(self.get_parameter("hard_sample_conf_thres").value)
         self.hard_sample_interval_s = float(self.get_parameter("hard_sample_interval_s").value)
-        self.force_save_samples = bool(self.get_parameter("force_save_samples").value)
+        self.force_save_samples = self.parse_bool(self.get_parameter("force_save_samples").value)
         self.force_sample_interval_s = float(self.get_parameter("force_sample_interval_s").value)
         self.hard_sample_dir = self.get_parameter("hard_sample_dir").value
         os.makedirs(self.hard_sample_dir, exist_ok=True)
@@ -201,6 +201,15 @@ class TargetLocalizerNode(Node):
         self.get_logger().info(
             f"Target localizer started. mode={self.detector_mode}, yolo_every_n_frames={self.yolo_every_n_frames}"
         )
+
+    @staticmethod
+    def parse_bool(value):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        text = str(value).strip().lower()
+        return text in ("1", "true", "yes", "on")
 
     def on_arm_state(self, msg):
         try:
