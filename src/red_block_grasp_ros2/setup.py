@@ -25,6 +25,7 @@ setup(
             "roarm_driver_node = red_block_grasp_ros2.nodes.roarm_driver_node:main",
             "task_manager_node = red_block_grasp_ros2.nodes.task_manager_node:main",
             "visual_servo_task_node = red_block_grasp_ros2.nodes.visual_servo_task_node:main",
+            "open_loop_grasp_task_node = red_block_grasp_ros2.nodes.open_loop_grasp_task_node:main",
             "execution_logger_node = red_block_grasp_ros2.nodes.execution_logger_node:main",
         ],
     },
