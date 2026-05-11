@@ -52,6 +52,10 @@ class RedColorBlockDetector:
         circularity_min=0.0,
         morph_kernel_size=5,
         erode_kernel_size=5,
+        hsv_h1_min=0,
+        hsv_h1_max=10,
+        hsv_h2_min=170,
+        hsv_h2_max=180,
         hsv_s_min=70,
         hsv_v_min=45,
         lab_a_min=145,
@@ -76,6 +80,10 @@ class RedColorBlockDetector:
         self.circularity_min = float(circularity_min)
         self.morph_kernel_size = int(max(3, morph_kernel_size))
         self.erode_kernel_size = int(max(3, erode_kernel_size))
+        self.hsv_h1_min = int(hsv_h1_min)
+        self.hsv_h1_max = int(hsv_h1_max)
+        self.hsv_h2_min = int(hsv_h2_min)
+        self.hsv_h2_max = int(hsv_h2_max)
         self.hsv_s_min = int(hsv_s_min)
         self.hsv_v_min = int(hsv_v_min)
         self.lab_a_min = int(lab_a_min)
@@ -97,13 +105,13 @@ class RedColorBlockDetector:
 
         hsv_low = cv2.inRange(
             hsv,
-            np.array([0, self.hsv_s_min, self.hsv_v_min], dtype=np.uint8),
-            np.array([10, 255, 255], dtype=np.uint8),
+            np.array([self.hsv_h1_min, self.hsv_s_min, self.hsv_v_min], dtype=np.uint8),
+            np.array([self.hsv_h1_max, 255, 255], dtype=np.uint8),
         )
         hsv_high = cv2.inRange(
             hsv,
-            np.array([170, self.hsv_s_min, self.hsv_v_min], dtype=np.uint8),
-            np.array([180, 255, 255], dtype=np.uint8),
+            np.array([self.hsv_h2_min, self.hsv_s_min, self.hsv_v_min], dtype=np.uint8),
+            np.array([self.hsv_h2_max, 255, 255], dtype=np.uint8),
         )
         hsv_mask = cv2.bitwise_or(hsv_low, hsv_high)
 

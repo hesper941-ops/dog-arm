@@ -14,6 +14,7 @@ def generate_launch_description():
     show_window = LaunchConfiguration("show_window")
     detector_mode = LaunchConfiguration("detector_mode")
     yolo_every_n_frames = LaunchConfiguration("yolo_every_n_frames")
+    color_calib_path = LaunchConfiguration("color_calib_path")
     enable_execution_logger = LaunchConfiguration("enable_execution_logger")
     infer_imgsz = LaunchConfiguration("infer_imgsz")
     target_timer_period = LaunchConfiguration("target_timer_period")
@@ -32,6 +33,10 @@ def generate_launch_description():
             DeclareLaunchArgument("show_window", default_value="false"),
             DeclareLaunchArgument("detector_mode", default_value="fusion"),
             DeclareLaunchArgument("yolo_every_n_frames", default_value="5"),
+            DeclareLaunchArgument(
+                "color_calib_path",
+                default_value="/home/sunrise/dog/ros2_red_block_ws/src/red_block_grasp_ros2/config/red_color_calib.yaml",
+            ),
             DeclareLaunchArgument("enable_execution_logger", default_value="true"),
             DeclareLaunchArgument("infer_imgsz", default_value="256"),
             DeclareLaunchArgument("target_timer_period", default_value="0.08"),
@@ -66,6 +71,7 @@ def generate_launch_description():
                         "perf_log_interval_s": 3.0,
                         "detector_mode": detector_mode,
                         "yolo_every_n_frames": yolo_every_n_frames,
+                        "color_calib_path": color_calib_path,
                         "enable_color_detector": True,
                         "enable_yolo_detector": True,
                         "fusion_iou_threshold": 0.10,

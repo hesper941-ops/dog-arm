@@ -43,6 +43,7 @@ class TargetLocalizerNode(Node):
         self.declare_parameter("yolo_every_n_frames", 5)
         self.declare_parameter("enable_color_detector", True)
         self.declare_parameter("enable_yolo_detector", True)
+        self.declare_parameter("color_calib_path", "")
         self.declare_parameter("fusion_iou_threshold", 0.10)
         self.declare_parameter("stable_frame_count", 3)
         self.declare_parameter("stable_position_threshold_mm", 20.0)
@@ -60,6 +61,10 @@ class TargetLocalizerNode(Node):
         self.declare_parameter("color_solidity_min", 0.50)
         self.declare_parameter("color_morph_kernel_size", 5)
         self.declare_parameter("color_erode_kernel_size", 5)
+        self.declare_parameter("color_hsv_h1_min", 0)
+        self.declare_parameter("color_hsv_h1_max", 10)
+        self.declare_parameter("color_hsv_h2_min", 170)
+        self.declare_parameter("color_hsv_h2_max", 180)
         self.declare_parameter("color_hsv_s_min", 70)
         self.declare_parameter("color_hsv_v_min", 45)
         self.declare_parameter("color_lab_a_min", 145)
@@ -102,6 +107,7 @@ class TargetLocalizerNode(Node):
         self.yolo_every_n_frames = max(1, int(self.get_parameter("yolo_every_n_frames").value))
         self.enable_color_detector = self.parse_bool(self.get_parameter("enable_color_detector").value)
         self.enable_yolo_detector = self.parse_bool(self.get_parameter("enable_yolo_detector").value)
+        self.color_calib_path = str(self.get_parameter("color_calib_path").value).strip()
         self.fusion_iou_threshold = float(self.get_parameter("fusion_iou_threshold").value)
         self.stable_frame_count = max(1, int(self.get_parameter("stable_frame_count").value))
         self.stable_position_threshold_mm = float(self.get_parameter("stable_position_threshold_mm").value)
@@ -124,6 +130,9 @@ class TargetLocalizerNode(Node):
         self.force_sample_interval_s = float(self.get_parameter("force_sample_interval_s").value)
         self.hard_sample_dir = self.get_parameter("hard_sample_dir").value
         os.makedirs(self.hard_sample_dir, exist_ok=True)
+
+        self.color_params = self.build_color_params()
+        self.apply_color_calib_file(self.color_params)
 
         self.pub_target = self.create_publisher(String, "/red_block/target_base", 10)
         self.sub_arm_state = self.create_subscription(String, "/roarm_m3/state", self.on_arm_state, 10)
@@ -154,26 +163,31 @@ class TargetLocalizerNode(Node):
         self.color_detector = None
         if self.enable_color_detector and self.detector_mode in ("color", "fusion"):
             self.color_detector = RedColorBlockDetector(
-                min_depth_mm=float(self.get_parameter("color_min_depth_mm").value),
-                max_depth_mm=float(self.get_parameter("color_max_depth_mm").value),
-                min_area=float(self.get_parameter("color_min_area").value),
-                min_area_ratio=float(self.get_parameter("color_min_area_ratio").value),
-                max_area_ratio=float(self.get_parameter("color_max_area_ratio").value),
-                aspect_min=float(self.get_parameter("color_aspect_min").value),
-                aspect_max=float(self.get_parameter("color_aspect_max").value),
-                extent_min=float(self.get_parameter("color_extent_min").value),
-                solidity_min=float(self.get_parameter("color_solidity_min").value),
-                morph_kernel_size=int(self.get_parameter("color_morph_kernel_size").value),
-                erode_kernel_size=int(self.get_parameter("color_erode_kernel_size").value),
-                hsv_s_min=int(self.get_parameter("color_hsv_s_min").value),
-                hsv_v_min=int(self.get_parameter("color_hsv_v_min").value),
-                lab_a_min=int(self.get_parameter("color_lab_a_min").value),
-                bgr_r_min=int(self.get_parameter("color_bgr_r_min").value),
-                bgr_rg_delta=int(self.get_parameter("color_bgr_rg_delta").value),
-                bgr_rb_delta=int(self.get_parameter("color_bgr_rb_delta").value),
-                bgr_b_max=int(self.get_parameter("color_bgr_b_max").value),
+                min_depth_mm=self.color_params["color_min_depth_mm"],
+                max_depth_mm=self.color_params["color_max_depth_mm"],
+                min_area=self.color_params["color_min_area"],
+                min_area_ratio=self.color_params["color_min_area_ratio"],
+                max_area_ratio=self.color_params["color_max_area_ratio"],
+                aspect_min=self.color_params["color_aspect_min"],
+                aspect_max=self.color_params["color_aspect_max"],
+                extent_min=self.color_params["color_extent_min"],
+                solidity_min=self.color_params["color_solidity_min"],
+                morph_kernel_size=self.color_params["color_morph_kernel_size"],
+                erode_kernel_size=self.color_params["color_erode_kernel_size"],
+                hsv_h1_min=self.color_params["color_hsv_h1_min"],
+                hsv_h1_max=self.color_params["color_hsv_h1_max"],
+                hsv_h2_min=self.color_params["color_hsv_h2_min"],
+                hsv_h2_max=self.color_params["color_hsv_h2_max"],
+                hsv_s_min=self.color_params["color_hsv_s_min"],
+                hsv_v_min=self.color_params["color_hsv_v_min"],
+                lab_a_min=self.color_params["color_lab_a_min"],
+                bgr_r_min=self.color_params["color_bgr_r_min"],
+                bgr_rg_delta=self.color_params["color_bgr_rg_delta"],
+                bgr_rb_delta=self.color_params["color_bgr_rb_delta"],
+                bgr_b_max=self.color_params["color_bgr_b_max"],
                 max_targets=self.max_targets,
             )
+            self.log_color_params()
 
         self.localizer = TargetLocalizer(
             handeye_path=self.handeye_path,
@@ -210,6 +224,115 @@ class TargetLocalizerNode(Node):
             return False
         text = str(value).strip().lower()
         return text in ("1", "true", "yes", "on")
+
+    def build_color_params(self):
+        return {
+            "color_hsv_h1_min": int(self.get_parameter("color_hsv_h1_min").value),
+            "color_hsv_h1_max": int(self.get_parameter("color_hsv_h1_max").value),
+            "color_hsv_h2_min": int(self.get_parameter("color_hsv_h2_min").value),
+            "color_hsv_h2_max": int(self.get_parameter("color_hsv_h2_max").value),
+            "color_hsv_s_min": int(self.get_parameter("color_hsv_s_min").value),
+            "color_hsv_v_min": int(self.get_parameter("color_hsv_v_min").value),
+            "color_lab_a_min": int(self.get_parameter("color_lab_a_min").value),
+            "color_bgr_r_min": int(self.get_parameter("color_bgr_r_min").value),
+            "color_bgr_rg_delta": int(self.get_parameter("color_bgr_rg_delta").value),
+            "color_bgr_rb_delta": int(self.get_parameter("color_bgr_rb_delta").value),
+            "color_bgr_b_max": int(self.get_parameter("color_bgr_b_max").value),
+            "color_min_area": float(self.get_parameter("color_min_area").value),
+            "color_min_area_ratio": float(self.get_parameter("color_min_area_ratio").value),
+            "color_max_area_ratio": float(self.get_parameter("color_max_area_ratio").value),
+            "color_aspect_min": float(self.get_parameter("color_aspect_min").value),
+            "color_aspect_max": float(self.get_parameter("color_aspect_max").value),
+            "color_extent_min": float(self.get_parameter("color_extent_min").value),
+            "color_solidity_min": float(self.get_parameter("color_solidity_min").value),
+            "color_morph_kernel_size": int(self.get_parameter("color_morph_kernel_size").value),
+            "color_erode_kernel_size": int(self.get_parameter("color_erode_kernel_size").value),
+            "color_min_depth_mm": float(self.get_parameter("color_min_depth_mm").value),
+            "color_max_depth_mm": float(self.get_parameter("color_max_depth_mm").value),
+        }
+
+    def read_calib_file(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        if ext == ".json":
+            return json.loads(text)
+
+        if ext in (".yaml", ".yml"):
+            try:
+                import yaml
+            except ImportError as exc:
+                raise RuntimeError(
+                    "PyYAML is required to read YAML color calibration files. "
+                    "Install python3-yaml or provide a JSON file."
+                ) from exc
+            return yaml.safe_load(text)
+
+        try:
+            import yaml
+            data = yaml.safe_load(text)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return json.loads(text)
+
+    def apply_color_calib_file(self, color_params):
+        if not self.color_calib_path:
+            return
+
+        if not os.path.exists(self.color_calib_path):
+            self.get_logger().warn(
+                f"Color calibration file does not exist: {self.color_calib_path}. Using ROS/default color parameters."
+            )
+            return
+
+        try:
+            data = self.read_calib_file(self.color_calib_path)
+        except Exception as exc:
+            self.get_logger().warn(
+                f"Failed to load color calibration file {self.color_calib_path}: {exc}. "
+                "Using ROS/default color parameters."
+            )
+            return
+
+        if not isinstance(data, dict):
+            self.get_logger().warn(
+                f"Color calibration file {self.color_calib_path} did not contain a mapping. "
+                "Using ROS/default color parameters."
+            )
+            return
+
+        loaded_keys = []
+        for key in color_params:
+            if key not in data:
+                continue
+            try:
+                if isinstance(color_params[key], int):
+                    color_params[key] = int(data[key])
+                else:
+                    color_params[key] = float(data[key])
+                loaded_keys.append(key)
+            except Exception as exc:
+                self.get_logger().warn(f"Ignoring invalid color calibration value for {key}: {exc}")
+
+        self.get_logger().info(
+            f"Loaded color calibration from {self.color_calib_path}. Updated keys: {', '.join(loaded_keys)}"
+        )
+
+    def log_color_params(self):
+        p = self.color_params
+        self.get_logger().info(
+            "Color detector params: "
+            f"H=[{p['color_hsv_h1_min']},{p['color_hsv_h1_max']}]|"
+            f"[{p['color_hsv_h2_min']},{p['color_hsv_h2_max']}], "
+            f"S_min={p['color_hsv_s_min']}, V_min={p['color_hsv_v_min']}, "
+            f"Lab_a_min={p['color_lab_a_min']}, "
+            f"R_min={p['color_bgr_r_min']}, "
+            f"R-G>={p['color_bgr_rg_delta']}, R-B>={p['color_bgr_rb_delta']}, "
+            f"B_max={p['color_bgr_b_max']}, min_area={p['color_min_area']}"
+        )
 
     def on_arm_state(self, msg):
         try:
