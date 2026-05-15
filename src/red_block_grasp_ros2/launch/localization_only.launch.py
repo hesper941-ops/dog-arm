@@ -16,6 +16,16 @@ def generate_launch_description():
     color_calib_path = LaunchConfiguration("color_calib_path")
     infer_imgsz = LaunchConfiguration("infer_imgsz")
     target_timer_period = LaunchConfiguration("target_timer_period")
+    enable_target_lock = LaunchConfiguration("enable_target_lock")
+    lock_max_pixel_jump = LaunchConfiguration("lock_max_pixel_jump")
+    color_morph_kernel_size = LaunchConfiguration("color_morph_kernel_size")
+    color_erode_kernel_size = LaunchConfiguration("color_erode_kernel_size")
+    color_min_area = LaunchConfiguration("color_min_area")
+    color_max_area_ratio = LaunchConfiguration("color_max_area_ratio")
+    color_aspect_min = LaunchConfiguration("color_aspect_min")
+    color_aspect_max = LaunchConfiguration("color_aspect_max")
+    color_extent_min = LaunchConfiguration("color_extent_min")
+    color_solidity_min = LaunchConfiguration("color_solidity_min")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -54,6 +64,16 @@ def generate_launch_description():
             "target_timer_period",
             default_value="0.08",
         ),
+        DeclareLaunchArgument("enable_target_lock", default_value="true"),
+        DeclareLaunchArgument("lock_max_pixel_jump", default_value="160.0"),
+        DeclareLaunchArgument("color_morph_kernel_size", default_value="5"),
+        DeclareLaunchArgument("color_erode_kernel_size", default_value="5"),
+        DeclareLaunchArgument("color_min_area", default_value="250.0"),
+        DeclareLaunchArgument("color_max_area_ratio", default_value="0.35"),
+        DeclareLaunchArgument("color_aspect_min", default_value="0.35"),
+        DeclareLaunchArgument("color_aspect_max", default_value="3.0"),
+        DeclareLaunchArgument("color_extent_min", default_value="0.25"),
+        DeclareLaunchArgument("color_solidity_min", default_value="0.50"),
 
         Node(
             package="red_block_grasp_ros2",
@@ -88,6 +108,16 @@ def generate_launch_description():
                     "color_calib_path": color_calib_path,
                     "enable_color_detector": True,
                     "enable_yolo_detector": True,
+                    "enable_target_lock": enable_target_lock,
+                    "lock_max_pixel_jump": lock_max_pixel_jump,
+                    "color_morph_kernel_size": color_morph_kernel_size,
+                    "color_erode_kernel_size": color_erode_kernel_size,
+                    "color_min_area": color_min_area,
+                    "color_max_area_ratio": color_max_area_ratio,
+                    "color_aspect_min": color_aspect_min,
+                    "color_aspect_max": color_aspect_max,
+                    "color_extent_min": color_extent_min,
+                    "color_solidity_min": color_solidity_min,
                 }
             ],
         ),

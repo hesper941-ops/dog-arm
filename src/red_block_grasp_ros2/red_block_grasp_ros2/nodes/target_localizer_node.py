@@ -51,6 +51,7 @@ class TargetLocalizerNode(Node):
         self.declare_parameter("publish_only_stable", False)
         self.declare_parameter("target_lock_timeout_s", 1.0)
         self.declare_parameter("fusion_min_color_to_yolo_area_ratio", 0.45)
+        self.declare_parameter("fusion_edge_margin_ratio", 0.18)
 
         self.declare_parameter("color_min_depth_mm", 100.0)
         self.declare_parameter("color_max_depth_mm", 700.0)
@@ -119,6 +120,7 @@ class TargetLocalizerNode(Node):
         self.fusion_min_color_to_yolo_area_ratio = float(
             self.get_parameter("fusion_min_color_to_yolo_area_ratio").value
         )
+        self.fusion_edge_margin_ratio = float(self.get_parameter("fusion_edge_margin_ratio").value)
 
         self.safe_roi_x_min_ratio = float(self.get_parameter("safe_roi_x_min_ratio").value)
         self.safe_roi_x_max_ratio = float(self.get_parameter("safe_roi_x_max_ratio").value)
@@ -385,6 +387,7 @@ class TargetLocalizerNode(Node):
         return max(1, int(det.x2 - det.x1) * int(det.y2 - det.y1))
 
     def clear_target_lock(self):
+        # 锁丢失后一起清理滤波状态，避免两个红块的 base 坐标混在同一窗口里。
         self.locked_pixel = None
         self.lock_last_seen_time = 0.0
         self.filtered_base = None
@@ -435,6 +438,7 @@ class TargetLocalizerNode(Node):
             det.debug_info["best_yolo_iou"] = 0.0
             det.debug_info["best_yolo_area_ratio"] = None
             det.debug_info["fusion_small_local"] = False
+            det.debug_info["fusion_edge_local"] = False
             if not yolo_detections:
                 continue
 
@@ -444,9 +448,23 @@ class TargetLocalizerNode(Node):
             yolo_area = float(self.bbox_area(best_yolo))
             color_area = float(self.bbox_area(det))
             area_ratio = color_area / max(yolo_area, 1.0)
+            yolo_w = max(1, best_yolo.width)
+            yolo_h = max(1, best_yolo.height)
+            edge_margin_x = self.fusion_edge_margin_ratio * yolo_w
+            edge_margin_y = self.fusion_edge_margin_ratio * yolo_h
+            cx, cy = det.center
+            edge_local = (
+                cx < best_yolo.x1 + edge_margin_x
+                or cx > best_yolo.x2 - edge_margin_x
+                or cy < best_yolo.y1 + edge_margin_y
+                or cy > best_yolo.y2 - edge_margin_y
+            )
             det.debug_info["best_yolo_area_ratio"] = float(area_ratio)
+            det.debug_info["fusion_edge_local"] = bool(edge_local)
             det.debug_info["fusion_small_local"] = bool(
-                best_iou >= self.fusion_iou_threshold and area_ratio < self.fusion_min_color_to_yolo_area_ratio
+                best_iou >= self.fusion_iou_threshold
+                and area_ratio < self.fusion_min_color_to_yolo_area_ratio
+                and edge_local
             )
 
     def select_fusion_detection(self, color_detections, yolo_detections, image_width, image_height, now=None):
@@ -477,13 +495,12 @@ class TargetLocalizerNode(Node):
             selected, reason = self.select_detection(yolo_detections, image_width, image_height, now=now)
             if selected is not None and color_detections:
                 return selected, "fusion_yolo_color_confirm" if reason == "new_target" else reason, "yolo_assisted"
-
         if color_detections:
             selected, reason = self.select_detection(color_detections, image_width, image_height, now=now)
             return selected, "fusion_color_local_only" if selected is not None else reason, "color_local"
 
-        selected, reason = self.select_detection(yolo_detections, image_width, image_height, now=now)
-        return selected, "fusion_yolo_fallback" if selected is not None else reason, "yolo_fallback"
+        # fusion 模式下没有颜色确认时不盲信 YOLO，避免现场光照波动时误抓。
+        return None, "fusion_no_color_confirmation", "none"
 
     def filter_base(self, base):
         current = {key: float(base[key]) for key in ("x", "y", "z")}
@@ -726,10 +743,30 @@ class TargetLocalizerNode(Node):
             (0, 255, 255),
             2,
         )
+        lock_active = self.target_lock_active(time.time())
+        lock_age = 0.0 if self.locked_pixel is None else max(0.0, time.time() - self.lock_last_seen_time)
+        locked_pixel_text = "none" if self.locked_pixel is None else f"({self.locked_pixel[0]},{self.locked_pixel[1]})"
+        debug_lines = [
+            f"LOCKED: {'yes' if lock_active else 'no'}",
+            f"lock_age: {lock_age:.2f}s",
+            f"locked_pixel: {locked_pixel_text}",
+            f"selected_source: {msg_dict.get('source')}",
+            f"detector_mode: {self.detector_mode}",
+        ]
+        for idx, line in enumerate(debug_lines):
+            cv2.putText(
+                display,
+                line,
+                (20, 65 + idx * 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                2,
+            )
 
         for idx, det in enumerate(yolo_detections):
             cv2.rectangle(display, (det.x1, det.y1), (det.x2, det.y2), (255, 0, 0), 2)
-            label = f"YOLO#{idx} conf={float(getattr(det, 'conf', 0.0)):.2f}"
+            label = f"YOLO conf={float(getattr(det, 'conf', 0.0)):.2f}"
             cv2.putText(
                 display,
                 label,
@@ -741,13 +778,15 @@ class TargetLocalizerNode(Node):
             )
         for idx, det in enumerate(color_detections):
             is_selected = selected is det
-            color = (0, 255, 255) if is_selected else (0, 165, 255)
+            color = (0, 255, 255) if is_selected else (0, 0, 255)
             cv2.rectangle(display, (det.x1, det.y1), (det.x2, det.y2), color, 3 if is_selected else 2)
             cv2.circle(display, det.center, 5, color, -1)
             det_area = float(det.debug_info.get("area", self.bbox_area(det)))
+            extent = float(det.debug_info.get("extent", 0.0))
+            solidity = float(det.debug_info.get("solidity", 0.0))
             label = (
-                f"COLOR#{idx} s={float(getattr(det, 'score', getattr(det, 'conf', 0.0))):.2f} "
-                f"a={det_area:.0f}"
+                f"COLOR score={float(getattr(det, 'score', getattr(det, 'conf', 0.0))):.2f} "
+                f"area={det_area:.0f} extent={extent:.2f} solidity={solidity:.2f}"
             )
             if det.debug_info.get("fusion_small_local", False):
                 label += " local"
@@ -766,7 +805,7 @@ class TargetLocalizerNode(Node):
             cv2.circle(display, selected.center, 5, (0, 255, 255), -1)
             cv2.putText(
                 display,
-                "SELECTED target",
+                "SELECTED",
                 (selected.x1, max(18, selected.y1 - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.50,
@@ -776,7 +815,7 @@ class TargetLocalizerNode(Node):
         elif selected is not None:
             cv2.putText(
                 display,
-                "SELECTED target",
+                "SELECTED",
                 (selected.x1, max(18, selected.y1 - 24)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.50,
@@ -790,22 +829,33 @@ class TargetLocalizerNode(Node):
                 f"{msg_dict.get('source')} stable={msg_dict.get('stable')} "
                 f"base=({base['x']:.1f},{base['y']:.1f},{base['z']:.1f})"
             )
-            cv2.putText(display, text, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+            cv2.putText(display, text, (20, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
             if selected is not None:
                 dbg = getattr(selected, "debug_info", {})
-                detail = (
-                    f"sel area={float(dbg.get('area', self.bbox_area(selected))):.0f} "
-                    f"extent={float(dbg.get('extent', 0.0)):.2f} "
-                    f"sol={float(dbg.get('solidity', 0.0)):.2f} "
-                    f"depth={dbg.get('depth_source', 'window')} "
-                    f"score={float(getattr(selected, 'score', getattr(selected, 'conf', 0.0))):.2f}"
-                )
-                cv2.putText(display, detail, (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
+                selected_lines = [
+                    f"selected_area: {float(dbg.get('area', self.bbox_area(selected))):.0f}",
+                    f"selected_score: {float(getattr(selected, 'score', getattr(selected, 'conf', 0.0))):.2f}",
+                    f"selected_depth: {float(msg_dict.get('depth_mm', 0.0)):.1f}",
+                    f"depth_source: {dbg.get('depth_source', 'window')}",
+                    f"color_mean_r: {float(dbg.get('mean_r', 0.0)):.1f}",
+                    f"color_rg_delta: {float(dbg.get('mean_rg_delta', 0.0)):.1f}",
+                    f"color_rb_delta: {float(dbg.get('mean_rb_delta', 0.0)):.1f}",
+                ]
+                for idx, line in enumerate(selected_lines):
+                    cv2.putText(
+                        display,
+                        line,
+                        (20, 220 + idx * 24),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 255),
+                        2,
+                    )
         else:
             cv2.putText(
                 display,
                 f"invalid: {msg_dict.get('reason')} / {msg_dict.get('select_reason')}",
-                (20, 75),
+                (20, 195),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 (0, 0, 255),

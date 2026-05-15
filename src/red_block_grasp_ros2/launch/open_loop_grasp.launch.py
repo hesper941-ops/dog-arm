@@ -19,6 +19,16 @@ def generate_launch_description():
     enable_execution_logger = LaunchConfiguration("enable_execution_logger")
     infer_imgsz = LaunchConfiguration("infer_imgsz")
     target_timer_period = LaunchConfiguration("target_timer_period")
+    enable_target_lock = LaunchConfiguration("enable_target_lock")
+    lock_max_pixel_jump = LaunchConfiguration("lock_max_pixel_jump")
+    color_morph_kernel_size = LaunchConfiguration("color_morph_kernel_size")
+    color_erode_kernel_size = LaunchConfiguration("color_erode_kernel_size")
+    color_min_area = LaunchConfiguration("color_min_area")
+    color_max_area_ratio = LaunchConfiguration("color_max_area_ratio")
+    color_aspect_min = LaunchConfiguration("color_aspect_min")
+    color_aspect_max = LaunchConfiguration("color_aspect_max")
+    color_extent_min = LaunchConfiguration("color_extent_min")
+    color_solidity_min = LaunchConfiguration("color_solidity_min")
 
     return LaunchDescription(
         [
@@ -42,6 +52,16 @@ def generate_launch_description():
             DeclareLaunchArgument("enable_execution_logger", default_value="true"),
             DeclareLaunchArgument("infer_imgsz", default_value="256"),
             DeclareLaunchArgument("target_timer_period", default_value="0.08"),
+            DeclareLaunchArgument("enable_target_lock", default_value="true"),
+            DeclareLaunchArgument("lock_max_pixel_jump", default_value="160.0"),
+            DeclareLaunchArgument("color_morph_kernel_size", default_value="5"),
+            DeclareLaunchArgument("color_erode_kernel_size", default_value="5"),
+            DeclareLaunchArgument("color_min_area", default_value="250.0"),
+            DeclareLaunchArgument("color_max_area_ratio", default_value="0.35"),
+            DeclareLaunchArgument("color_aspect_min", default_value="0.35"),
+            DeclareLaunchArgument("color_aspect_max", default_value="3.0"),
+            DeclareLaunchArgument("color_extent_min", default_value="0.25"),
+            DeclareLaunchArgument("color_solidity_min", default_value="0.50"),
             Node(
                 package="red_block_grasp_ros2",
                 executable="roarm_driver_node",
@@ -84,20 +104,20 @@ def generate_launch_description():
                         "publish_only_stable": False,
                         "color_min_depth_mm": 100.0,
                         "color_max_depth_mm": 700.0,
-                        "color_min_area": 250.0,
-                        "color_max_area_ratio": 0.35,
-                        "color_aspect_min": 0.35,
-                        "color_aspect_max": 3.0,
-                        "color_extent_min": 0.25,
-                        "color_solidity_min": 0.50,
-                        "color_morph_kernel_size": 5,
-                        "color_erode_kernel_size": 5,
+                        "color_min_area": color_min_area,
+                        "color_max_area_ratio": color_max_area_ratio,
+                        "color_aspect_min": color_aspect_min,
+                        "color_aspect_max": color_aspect_max,
+                        "color_extent_min": color_extent_min,
+                        "color_solidity_min": color_solidity_min,
+                        "color_morph_kernel_size": color_morph_kernel_size,
+                        "color_erode_kernel_size": color_erode_kernel_size,
                         "safe_roi_x_min_ratio": 0.12,
                         "safe_roi_x_max_ratio": 0.88,
                         "safe_roi_y_min_ratio": 0.12,
                         "safe_roi_y_max_ratio": 0.88,
-                        "enable_target_lock": True,
-                        "lock_max_pixel_jump": 160.0,
+                        "enable_target_lock": enable_target_lock,
+                        "lock_max_pixel_jump": lock_max_pixel_jump,
                         "center_weight": 0.25,
                         "base_filter_alpha": 0.55,
                     }

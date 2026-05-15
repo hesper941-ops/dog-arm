@@ -103,6 +103,7 @@ class RedColorBlockDetector:
         return value if value % 2 == 1 else value + 1
 
     def remove_small_components(self, binary, min_area):
+        # 参考 AIRBOT 的做法，形态学后再清理小连通域，避免碎红点进入候选。
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         cleaned = np.zeros(binary.shape, dtype=np.uint8)
         min_area_int = max(1, int(round(float(min_area))))
@@ -163,6 +164,77 @@ class RedColorBlockDetector:
         mask = cv2.dilate(mask, kernel_dilate, iterations=1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
         return mask
+
+    def merge_nearby_contours(self, contours, image_shape, depth_mm):
+        # 只合并“膨胀后轻微接触”的近邻碎块，尽量把同一红块局部拼回整体。
+        if len(contours) <= 1:
+            return contours
+
+        image_h, image_w = image_shape[:2]
+        merge_size = self._odd(max(5, self.morph_kernel_size + 4))
+        merge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (merge_size, merge_size))
+        masks = []
+        dilated_masks = []
+        centers = []
+        depths = []
+
+        for contour in contours:
+            candidate_mask = np.zeros((image_h, image_w), dtype=np.uint8)
+            cv2.drawContours(candidate_mask, [contour], -1, 255, thickness=-1)
+            masks.append(candidate_mask)
+            dilated_masks.append(cv2.dilate(candidate_mask, merge_kernel, iterations=1))
+            moments = cv2.moments(contour)
+            if abs(moments["m00"]) > 1e-6:
+                center = (int(round(moments["m10"] / moments["m00"])), int(round(moments["m01"] / moments["m00"])))
+            else:
+                x, y, w, h = cv2.boundingRect(contour)
+                center = (int(x + w / 2), int(y + h / 2))
+            centers.append(center)
+            depth, valid_depth, _ = self.robust_depth_from_mask(depth_mm, candidate_mask, center, image_shape)
+            depths.append(depth if valid_depth else None)
+
+        parents = list(range(len(contours)))
+
+        def find(idx):
+            while parents[idx] != idx:
+                parents[idx] = parents[parents[idx]]
+                idx = parents[idx]
+            return idx
+
+        def union(a, b):
+            ra = find(a)
+            rb = find(b)
+            if ra != rb:
+                parents[rb] = ra
+
+        for i in range(len(contours)):
+            for j in range(i + 1, len(contours)):
+                if cv2.countNonZero(cv2.bitwise_and(dilated_masks[i], dilated_masks[j])) <= 0:
+                    continue
+                depth_i = depths[i]
+                depth_j = depths[j]
+                if depth_i is not None and depth_j is not None and abs(float(depth_i) - float(depth_j)) > 80.0:
+                    continue
+                if self.pixel_distance(centers[i], centers[j]) > max(40.0, 2.2 * self.morph_kernel_size + 22.0):
+                    continue
+                union(i, j)
+
+        grouped_masks = {}
+        for idx, mask in enumerate(masks):
+            root = find(idx)
+            if root not in grouped_masks:
+                grouped_masks[root] = np.zeros((image_h, image_w), dtype=np.uint8)
+            grouped_masks[root] = cv2.bitwise_or(grouped_masks[root], mask)
+
+        merged = []
+        for merged_mask in grouped_masks.values():
+            merged_contours, _ = cv2.findContours(merged_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            merged.extend(merged_contours)
+        return merged
+
+    @staticmethod
+    def pixel_distance(p1, p2):
+        return float(np.hypot(float(p1[0]) - float(p2[0]), float(p1[1]) - float(p2[1])))
 
     def _scale_mask_to_depth(self, mask, depth_shape):
         depth_h, depth_w = depth_shape[:2]
@@ -244,14 +316,17 @@ class RedColorBlockDetector:
         mean_s = float(mean_hsv[1])
         mean_v = float(mean_hsv[2])
         mean_a = float(mean_lab[1])
+        rg_delta = mean_r - mean_g
+        rb_delta = mean_r - mean_b
 
         checks = {
             "mean_r_ok": mean_r >= max(70.0, float(self.bgr_r_min) * 0.95),
             "mean_s_ok": mean_s >= max(45.0, float(self.hsv_s_min) * 0.70),
             "mean_v_ok": mean_v >= max(45.0, float(self.hsv_v_min) * 0.85),
-            "mean_rg_ok": (mean_r - mean_g) >= max(18.0, float(self.bgr_rg_delta) * 0.75),
-            "mean_rb_ok": (mean_r - mean_b) >= max(15.0, float(self.bgr_rb_delta) * 0.75),
+            "mean_rg_ok": rg_delta >= max(18.0, float(self.bgr_rg_delta) * 0.75),
+            "mean_rb_ok": rb_delta >= max(15.0, float(self.bgr_rb_delta) * 0.75),
             "mean_lab_a_ok": mean_a >= max(140.0, float(self.lab_a_min) - 8.0),
+            "reject_green_bias": mean_g <= mean_r - 8.0,
         }
         return all(checks.values()), {
             "mean_b": mean_b,
@@ -260,21 +335,25 @@ class RedColorBlockDetector:
             "mean_s": mean_s,
             "mean_v": mean_v,
             "mean_lab_a": mean_a,
+            "mean_rg_delta": rg_delta,
+            "mean_rb_delta": rb_delta,
             **checks,
         }
 
     def _candidate_score(self, area, min_area, max_area, color_ratio, extent, solidity, rr_extent, rr_ratio, depth_valid, color_stats):
         area_floor = max(float(min_area), 1.0)
-        area_mid = max(area_floor * 2.5, float(max_area) * 0.10)
-        area_score = self._clamp01(float(area) / area_mid)
+        area_mid = max(area_floor * 3.0, float(max_area) * 0.10)
+        area_score = self._clamp01((float(area) - area_floor) / max(area_mid - area_floor, 1.0))
+        if float(area) < area_floor * 1.6:
+            area_score *= 0.70
 
         color_score = np.mean(
             [
                 self._clamp01((float(color_stats["mean_r"]) - max(70.0, float(self.bgr_r_min) * 0.95)) / 90.0),
                 self._clamp01((float(color_stats["mean_s"]) - max(45.0, float(self.hsv_s_min) * 0.70)) / 80.0),
                 self._clamp01((float(color_stats["mean_v"]) - max(45.0, float(self.hsv_v_min) * 0.85)) / 80.0),
-                self._clamp01((float(color_stats["mean_r"]) - float(color_stats["mean_g"]) - max(18.0, float(self.bgr_rg_delta) * 0.75)) / 70.0),
-                self._clamp01((float(color_stats["mean_r"]) - float(color_stats["mean_b"]) - max(15.0, float(self.bgr_rb_delta) * 0.75)) / 70.0),
+                self._clamp01((float(color_stats["mean_rg_delta"]) - max(18.0, float(self.bgr_rg_delta) * 0.75)) / 70.0),
+                self._clamp01((float(color_stats["mean_rb_delta"]) - max(15.0, float(self.bgr_rb_delta) * 0.75)) / 70.0),
                 self._clamp01((float(color_stats["mean_lab_a"]) - max(140.0, float(self.lab_a_min) - 8.0)) / 40.0),
                 self._clamp01(color_ratio),
             ]
@@ -312,6 +391,7 @@ class RedColorBlockDetector:
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = self.merge_nearby_contours(contours, bgr_image.shape, depth_mm)
 
         detections = []
         for contour in contours:
