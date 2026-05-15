@@ -117,6 +117,15 @@ ros2 topic echo /red_block/base_adjust_request
 - 官方关节控制 topic 是 `/joint_states`。
 - 消息类型是 `sensor_msgs/msg/JointState`。
 - 关节角单位是 `rad`。
+- 官方 `roarm_driver` 处理 RoArm-M3 时，`JointState` 必须包含正确的 `name`，不能只发 `position`。
+- RoArm-M3 需要这 6 个关节名：
+  - `base_link_to_link1`
+  - `link1_to_link2`
+  - `link2_to_link3`
+  - `link3_to_link4`
+  - `link4_to_link5`
+  - `link5_to_gripper_link`
+- 旧观察姿态 `B/S/E/T/R` 分别映射到前 5 个关节，第 6 个 `link5_to_gripper_link` 使用 `observe_gripper_rad`，默认 `1.5`。
 
 桥接脚本现在支持在启动后先发布一次官方观察关节姿态，再等待 `observe_wait_s` 后进入 `WAIT_TARGET`。
 

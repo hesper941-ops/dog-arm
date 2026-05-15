@@ -294,14 +294,17 @@ class VisualMoveItGraspNode(Node):
         return float(value_deg) * math.pi / 180.0
 
     def build_observe_joint_message(self):
-        # 官方文档确认 display.launch.py 通过 joint_states / JointState 发送关节角，单位为弧度。
+        # 官方 driver 会按关节名查找 JointState，因此这里必须同时提供 name 和 position。
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         joint_names = self.list_cfg("official_joint_names")
-        if joint_names:
-            msg.name = joint_names
+        if not joint_names:
+            raise ValueError("official_joint_names is empty")
+        if len(joint_names) != 6:
+            raise ValueError(f"official_joint_names must contain 6 joints, got {len(joint_names)}")
+        msg.name = joint_names
         unit_mode = str(self.cfg.get("official_joint_units", "rad")).strip().lower()
-        raw_positions = [
+        joint_deg_positions = [
             self.float_cfg("observe_b_deg", 0.0),
             self.float_cfg("observe_s_deg", 0.0),
             self.float_cfg("observe_e_deg", 70.0),
@@ -309,9 +312,15 @@ class VisualMoveItGraspNode(Node):
             self.float_cfg("observe_r_deg", -90.0),
         ]
         if unit_mode == "deg":
-            msg.position = [float(v) for v in raw_positions]
+            converted = [float(v) for v in joint_deg_positions]
         else:
-            msg.position = [self.deg_to_rad(v) for v in raw_positions]
+            converted = [self.deg_to_rad(v) for v in joint_deg_positions]
+        converted.append(self.float_cfg("observe_gripper_rad", 1.5))
+        msg.position = converted
+        if len(msg.name) != len(msg.position):
+            raise ValueError(
+                f"observe JointState name/position length mismatch: {len(msg.name)} vs {len(msg.position)}"
+            )
         return msg
 
     def move_to_observe_joint_pose(self):
@@ -322,19 +331,33 @@ class VisualMoveItGraspNode(Node):
             self.get_logger().error("官方关节控制 topic 未初始化，不能自动回观察关节姿态")
             return False
 
-        msg = self.build_observe_joint_message()
+        try:
+            msg = self.build_observe_joint_message()
+        except Exception as exc:
+            self.get_logger().error(f"构造观察关节姿态消息失败: {exc}")
+            return False
         topic_name = str(self.cfg.get("official_joint_topic", "/joint_states")).strip() or "/joint_states"
         unit_mode = str(self.cfg.get("official_joint_units", "rad")).strip().lower()
         self.get_logger().info(
             "发布观察关节姿态到官方 topic: "
-            f"topic={topic_name}, unit={unit_mode}, position={list(msg.position)}"
+            f"topic={topic_name}, unit={unit_mode}, names={list(msg.name)}, position={list(msg.position)}"
         )
         if self.bool_cfg("dry_run"):
             self.get_logger().info("MOVE_TO_OBSERVE_JOINT_POSE: dry_run=true，仅打印，不发布关节角")
             return True
 
         try:
-            self.pub_joint.publish(msg)
+            publish_duration_s = max(0.1, self.float_cfg("observe_joint_publish_duration_s", 1.0))
+            publish_rate_hz = max(1.0, self.float_cfg("observe_joint_publish_rate_hz", 10.0))
+            publish_count = max(1, int(round(publish_duration_s * publish_rate_hz)))
+            sleep_s = 1.0 / publish_rate_hz
+            for _ in range(publish_count):
+                msg.header.stamp = self.get_clock().now().to_msg()
+                if len(msg.name) != len(msg.position):
+                    self.get_logger().error("观察关节姿态消息长度不一致，拒绝发布")
+                    return False
+                self.pub_joint.publish(msg)
+                time.sleep(sleep_s)
             return True
         except Exception as exc:
             self.get_logger().error(f"发布观察关节姿态失败: {exc}")

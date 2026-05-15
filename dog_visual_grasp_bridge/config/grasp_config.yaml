@@ -40,8 +40,17 @@ observe_wait_s: 3.0
 
 joint_command_mode: official_joint_topic
 official_joint_topic: /joint_states
-official_joint_names: []
+official_joint_names:
+  - base_link_to_link1
+  - link1_to_link2
+  - link2_to_link3
+  - link3_to_link4
+  - link4_to_link5
+  - link5_to_gripper_link
 official_joint_units: rad
+observe_gripper_rad: 1.5
+observe_joint_publish_duration_s: 1.0
+observe_joint_publish_rate_hz: 10.0
 
 gripper_open_value: 1.5
 gripper_close_value: 0.7
