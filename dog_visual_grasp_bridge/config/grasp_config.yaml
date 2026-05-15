@@ -1,0 +1,39 @@
+input_unit: mm
+moveit_position_scale: 0.001
+moveit_frame_id: base_link
+
+moveit_x_sign: 1.0
+moveit_y_sign: 1.0
+moveit_z_sign: 1.0
+
+moveit_x_offset_m: 0.0
+moveit_y_offset_m: 0.0
+moveit_z_offset_m: 0.0
+
+pre_grasp_z_offset_mm: 140.0
+grasp_offset_x_mm: 0.0
+grasp_offset_y_mm: 0.0
+grasp_offset_z_mm: 30.0
+lift_up_mm: 80.0
+
+workspace_x_min_mm: 120.0
+workspace_x_max_mm: 500.0
+workspace_y_min_mm: -300.0
+workspace_y_max_mm: 300.0
+workspace_z_min_mm: 50.0
+workspace_z_max_mm: 330.0
+
+stable_target_min_frames: 3
+stable_target_max_position_std_mm: 30.0
+stage_target_max_age_s: 3.0
+
+gripper_open_value: 1.5
+gripper_close_value: 0.7
+gripper_close_value_strong: 0.5
+
+auto_start: true
+dry_run: false
+enable_gripper: true
+enable_base_adjust_request: true
+
+base_adjust_topic: /red_block/base_adjust_request
