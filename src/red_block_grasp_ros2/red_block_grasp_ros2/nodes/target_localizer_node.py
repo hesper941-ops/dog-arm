@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from roarm_msgs.srv import GetPoseCmd
 from std_msgs.msg import String
 
 from red_block_grasp_ros2.core.camera_rgbd_orbbec import OrbbecRgbdCamera
@@ -57,6 +58,11 @@ class TargetLocalizerNode(Node):
         self.declare_parameter("target_hold_timeout_s", 0.6)
         self.declare_parameter("target_hold_max_pixel_drift", 80.0)
         self.declare_parameter("target_hold_max_base_drift_mm", 80.0)
+        self.declare_parameter("arm_state_source", "dog_arm_topic")
+        self.declare_parameter("official_get_pose_service", "/get_pose_cmd")
+        self.declare_parameter("official_pose_position_scale", 1000.0)
+        self.declare_parameter("official_pose_timeout_s", 0.5)
+        self.declare_parameter("official_pose_poll_period_s", 0.1)
 
         self.declare_parameter("color_min_depth_mm", 100.0)
         self.declare_parameter("color_max_depth_mm", 700.0)
@@ -134,6 +140,15 @@ class TargetLocalizerNode(Node):
         self.target_hold_timeout_s = float(self.get_parameter("target_hold_timeout_s").value)
         self.target_hold_max_pixel_drift = float(self.get_parameter("target_hold_max_pixel_drift").value)
         self.target_hold_max_base_drift_mm = float(self.get_parameter("target_hold_max_base_drift_mm").value)
+        self.arm_state_source = str(self.get_parameter("arm_state_source").value).strip().lower()
+        if self.arm_state_source not in ("dog_arm_topic", "official_get_pose_cmd", "none"):
+            self.arm_state_source = "dog_arm_topic"
+        self.official_get_pose_service = str(self.get_parameter("official_get_pose_service").value).strip()
+        if not self.official_get_pose_service:
+            self.official_get_pose_service = "/get_pose_cmd"
+        self.official_pose_position_scale = float(self.get_parameter("official_pose_position_scale").value)
+        self.official_pose_timeout_s = max(0.05, float(self.get_parameter("official_pose_timeout_s").value))
+        self.official_pose_poll_period_s = max(0.05, float(self.get_parameter("official_pose_poll_period_s").value))
 
         self.safe_roi_x_min_ratio = float(self.get_parameter("safe_roi_x_min_ratio").value)
         self.safe_roi_x_max_ratio = float(self.get_parameter("safe_roi_x_max_ratio").value)
@@ -156,13 +171,23 @@ class TargetLocalizerNode(Node):
         self.apply_color_calib_file(self.color_params)
 
         self.pub_target = self.create_publisher(String, "/red_block/target_base", 10)
-        self.sub_arm_state = self.create_subscription(String, "/roarm_m3/state", self.on_arm_state, 10)
+        self.sub_arm_state = None
+        if self.arm_state_source == "dog_arm_topic":
+            self.sub_arm_state = self.create_subscription(String, "/roarm_m3/state", self.on_arm_state, 10)
+        self.official_pose_client = None
+        self.official_pose_future = None
+        self.last_official_pose_request_time = 0.0
+        self.last_official_pose_warn_time = 0.0
+        if self.arm_state_source == "official_get_pose_cmd":
+            self.official_pose_client = self.create_client(GetPoseCmd, self.official_get_pose_service)
 
         self.latest_arm_state = None
         self.latest_arm_state_time = 0.0
+        self.latest_official_pose = None
         self.locked_pixel = None
         self.lock_last_seen_time = 0.0
         self.locked_area = None
+        self.last_rejected_locked_small_area_count = 0
         self.filtered_base = None
         self.stable_window = deque(maxlen=self.stable_frame_count)
         self.frame_index = 0
@@ -244,7 +269,8 @@ class TargetLocalizerNode(Node):
 
         self.timer = self.create_timer(self.timer_period, self.on_timer)
         self.get_logger().info(
-            f"Target localizer started. mode={self.detector_mode}, yolo_every_n_frames={self.yolo_every_n_frames}"
+            f"Target localizer started. mode={self.detector_mode}, yolo_every_n_frames={self.yolo_every_n_frames}, "
+            f"arm_state_source={self.arm_state_source}"
         )
 
     @staticmethod
@@ -383,6 +409,68 @@ class TargetLocalizerNode(Node):
             self.latest_arm_state = state
             self.latest_arm_state_time = time.time()
 
+    def convert_official_pose_to_arm_state(self, response):
+        # 官方 /get_pose_cmd 返回 m，这里按现有手眼链路统一转换成 mm。
+        scale = self.official_pose_position_scale
+        arm_state = {
+            "x": float(response.x) * scale,
+            "y": float(response.y) * scale,
+            "z": float(response.z) * scale,
+            "r": float(response.roll),
+            "tit": float(response.pitch),
+            "b": float(response.yaw),
+            "roll": float(response.roll),
+            "pitch": float(response.pitch),
+            "yaw": float(response.yaw),
+        }
+        return arm_state
+
+    def refresh_official_arm_pose(self, now):
+        if self.arm_state_source != "official_get_pose_cmd" or self.official_pose_client is None:
+            return
+
+        if self.official_pose_future is not None:
+            if not self.official_pose_future.done():
+                return
+            future = self.official_pose_future
+            self.official_pose_future = None
+            exc = future.exception()
+            if exc is not None:
+                self.get_logger().warn(f"official_get_pose_cmd call failed: {exc}")
+            else:
+                response = future.result()
+                if response is not None:
+                    self.latest_official_pose = response
+                    self.latest_arm_state = self.convert_official_pose_to_arm_state(response)
+                    self.latest_arm_state_time = now
+
+        if now - self.last_official_pose_request_time < self.official_pose_poll_period_s:
+            return
+
+        if not self.official_pose_client.service_is_ready():
+            if now - self.last_official_pose_warn_time >= 2.0:
+                self.last_official_pose_warn_time = now
+                self.get_logger().warn(
+                    "official_get_pose_cmd unavailable; please start official roarm_moveit_cmd command_control"
+                )
+            return
+
+        self.last_official_pose_request_time = now
+        self.official_pose_future = self.official_pose_client.call_async(GetPoseCmd.Request())
+
+    def get_arm_state_for_localization(self, now):
+        if self.arm_state_source == "none":
+            return None, "arm_state_disabled"
+        if self.latest_arm_state is None:
+            if self.arm_state_source == "official_get_pose_cmd":
+                return None, "official_pose_unavailable"
+            return None, "no_arm_state"
+
+        timeout_s = self.official_pose_timeout_s if self.arm_state_source == "official_get_pose_cmd" else 1.0
+        if now - self.latest_arm_state_time > timeout_s:
+            return None, "arm_state_timeout"
+        return self.latest_arm_state, None
+
     def detection_in_safe_roi(self, det, image_width, image_height):
         cx, cy = det.center
         return (
@@ -483,6 +571,7 @@ class TargetLocalizerNode(Node):
     def select_detection(self, detections, image_width, image_height, now=None):
         if now is None:
             now = time.time()
+        self.last_rejected_locked_small_area_count = 0
         if not detections:
             if self.locked_pixel is not None and not self.target_lock_active(now):
                 self.clear_target_lock()
@@ -495,16 +584,30 @@ class TargetLocalizerNode(Node):
             return None, "no_safe_detection"
 
         if self.target_lock_active(now):
+            min_replace_ratio = float(self.color_params.get("color_locked_replace_min_area_ratio", 0.30))
+            if self.locked_area is not None:
+                for det in safe:
+                    if not hasattr(det, "debug_info") or getattr(det, "debug_info") is None:
+                        det.debug_info = {}
+                    area = float(det.debug_info.get("area", self.bbox_area(det)))
+                    ratio = area / max(float(self.locked_area), 1.0)
+                    det.debug_info["locked_area"] = float(self.locked_area)
+                    det.debug_info["locked_area_ratio"] = float(ratio)
+                    det.debug_info["color_locked_replace_min_area_ratio"] = float(min_replace_ratio)
+                    det.debug_info["rejected_locked_small_area"] = bool(
+                        area < float(self.locked_area) * min_replace_ratio
+                    )
+                    if det.debug_info["rejected_locked_small_area"]:
+                        self.last_rejected_locked_small_area_count += 1
             nearest = min(safe, key=lambda det: self.pixel_distance(det.center, self.locked_pixel))
             nearest_debug = getattr(nearest, "debug_info", {})
             nearest_area = float(nearest_debug.get("area", self.bbox_area(nearest)))
-            min_replace_ratio = float(self.color_params.get("color_locked_replace_min_area_ratio", 0.30))
             if (
                 self.locked_area is not None
                 and nearest_area < float(self.locked_area) * min_replace_ratio
             ):
                 if hasattr(nearest, "debug_info"):
-                    nearest.debug_info["rejected_locked_area"] = True
+                    nearest.debug_info["rejected_locked_small_area"] = True
                 return None, "locked_target_small_area"
             if self.pixel_distance(nearest.center, self.locked_pixel) <= self.lock_max_pixel_jump:
                 return nearest, "locked_target"
@@ -532,19 +635,27 @@ class TargetLocalizerNode(Node):
             }
         max_candidate_area = max(float(det.debug_info.get("area", self.bbox_area(det))) for det in color_detections)
         min_ratio = float(self.color_params.get("color_relative_area_min_ratio", 0.25))
+        min_valid_depth_count = int(self.color_params.get("color_min_valid_depth_count", 8))
         min_area_allowed = max_candidate_area * min_ratio
         filtered = []
         rejected_small_area_count = 0
         for det in color_detections:
             area = float(det.debug_info.get("area", self.bbox_area(det)))
             visibility_score = 0.0 if max_candidate_area <= 1e-6 else area / max_candidate_area
+            valid_depth_count = int(det.debug_info.get("valid_depth_count", 0))
             det.debug_info["max_candidate_area"] = float(max_candidate_area)
             det.debug_info["visibility_score"] = float(visibility_score)
+            det.debug_info["relative_area_ratio"] = float(visibility_score)
             det.debug_info["area_ratio_to_max"] = float(visibility_score)
+            det.debug_info["color_min_valid_depth_count"] = int(min_valid_depth_count)
             det.debug_info["rejected_small_area"] = bool(area < min_area_allowed)
             if area < min_area_allowed:
                 rejected_small_area_count += 1
                 continue
+            if not bool(det.valid_depth) or valid_depth_count < min_valid_depth_count:
+                det.debug_info["rejected_invalid_depth"] = True
+                continue
+            det.debug_info["rejected_invalid_depth"] = False
             filtered.append(det)
         return {
             "max_candidate_area": float(max_candidate_area),
@@ -687,13 +798,19 @@ class TargetLocalizerNode(Node):
             "yolo_candidates_count": 0,
             "max_candidate_area": 0.0,
             "rejected_small_area_count": 0,
+            "rejected_locked_small_area_count": 0,
             "locked_area": None,
             "visibility_score": 0.0,
+            "relative_area_ratio": 0.0,
             "depth_valid": False,
             "valid_depth_count": 0,
+            "color_min_valid_depth_count": int(self.color_params.get("color_min_valid_depth_count", 8)),
+            "depth_source": "none",
             "image_width": int(image_width),
             "image_height": int(image_height),
+            "arm_state_source": self.arm_state_source,
             "arm_state_age_s": None,
+            "official_pose_age_s": None,
         }
 
     def publish_json(self, data):
@@ -709,6 +826,7 @@ class TargetLocalizerNode(Node):
         read_done = time.time()
 
         now = time.time()
+        self.refresh_official_arm_pose(now)
         dt = now - self.last_time
         self.last_time = now
         if dt > 1e-6:
@@ -745,36 +863,33 @@ class TargetLocalizerNode(Node):
                 "yolo_candidates_count": len(yolo_detections),
                 "max_candidate_area": float(color_summary.get("max_candidate_area", 0.0)),
                 "rejected_small_area_count": int(color_summary.get("rejected_small_area_count", 0)),
+                "rejected_locked_small_area_count": int(self.last_rejected_locked_small_area_count),
                 "locked_area": float(self.locked_area) if self.locked_area is not None else None,
             }
         )
         if self.latest_arm_state is not None:
             msg_dict["arm_state_age_s"] = now - self.latest_arm_state_time
+        if self.arm_state_source == "official_get_pose_cmd" and self.latest_arm_state_time > 0.0:
+            msg_dict["official_pose_age_s"] = now - self.latest_arm_state_time
 
         hold_reason = None
+        current_arm_state, arm_state_reason = self.get_arm_state_for_localization(now)
         if selected is None:
             msg_dict["reason"] = select_reason
             self.stable_window.clear()
             self.lost_frame_count += 1
             hold_reason = select_reason
-        elif self.latest_arm_state is None:
+        elif current_arm_state is None:
             self.locked_pixel = selected.center
             self.lock_last_seen_time = now
-            msg_dict["reason"] = "no_arm_state"
+            msg_dict["reason"] = arm_state_reason
             self.stable_window.clear()
             self.lost_frame_count += 1
-            hold_reason = "no_arm_state"
-        elif now - self.latest_arm_state_time > 1.0:
-            self.locked_pixel = selected.center
-            self.lock_last_seen_time = now
-            msg_dict["reason"] = "arm_state_timeout"
-            self.stable_window.clear()
-            self.lost_frame_count += 1
-            hold_reason = "arm_state_timeout"
+            hold_reason = arm_state_reason
         else:
             self.locked_pixel = selected.center
             self.lock_last_seen_time = now
-            location = self.localizer.localize(selected, bgr, depth_mm, camera_matrix, self.latest_arm_state)
+            location = self.localizer.localize(selected, bgr, depth_mm, camera_matrix, current_arm_state)
             if location is None:
                 msg_dict["reason"] = "invalid_depth"
                 self.stable_window.clear()
@@ -833,8 +948,13 @@ class TargetLocalizerNode(Node):
                     }
                 )
                 msg_dict["visibility_score"] = float(selected.debug_info.get("visibility_score", 0.0))
+                msg_dict["relative_area_ratio"] = float(selected.debug_info.get("relative_area_ratio", 0.0))
                 msg_dict["depth_valid"] = bool(selected.valid_depth)
                 msg_dict["valid_depth_count"] = int(selected.debug_info.get("valid_depth_count", 0))
+                msg_dict["color_min_valid_depth_count"] = int(
+                    selected.debug_info.get("color_min_valid_depth_count", self.color_params["color_min_valid_depth_count"])
+                )
+                msg_dict["depth_source"] = str(selected.debug_info.get("depth_source", "none"))
                 self.locked_area = float(selected.debug_info.get("area", self.bbox_area(selected)))
                 self.update_last_valid_target(selected, msg_dict, now)
 
@@ -944,6 +1064,8 @@ class TargetLocalizerNode(Node):
             f"locked_pixel: {locked_pixel_text}",
             f"selected_source: {msg_dict.get('source')}",
             f"detector_mode: {self.detector_mode}",
+            f"arm_state_source: {self.arm_state_source}",
+            f"official_pose_age_s: {float(msg_dict.get('official_pose_age_s', 0.0) or 0.0):.2f}",
             f"color_stable: {msg_dict.get('color_stable', False)}",
         ]
         for idx, line in enumerate(debug_lines):
@@ -1032,14 +1154,17 @@ class TargetLocalizerNode(Node):
                 selected_lines = [
                     f"selected_area: {float(dbg.get('area', self.bbox_area(selected))):.0f}",
                     f"max_candidate_area: {float(msg_dict.get('max_candidate_area', 0.0)):.0f}",
+                    f"relative_area_ratio: {float(msg_dict.get('relative_area_ratio', 0.0)):.2f}",
                     f"visibility_score: {float(msg_dict.get('visibility_score', 0.0)):.2f}",
                     f"depth_valid: {msg_dict.get('depth_valid', False)}",
                     f"valid_depth_count: {int(msg_dict.get('valid_depth_count', 0))}",
+                    f"min_valid_depth_count: {int(msg_dict.get('color_min_valid_depth_count', 0))}",
                     f"rejected_small_area_count: {int(msg_dict.get('rejected_small_area_count', 0))}",
+                    f"rejected_locked_small_area_count: {int(msg_dict.get('rejected_locked_small_area_count', 0))}",
                     f"locked_area: {float(msg_dict.get('locked_area', 0.0) or 0.0):.0f}",
                     f"selected_score: {float(getattr(selected, 'score', getattr(selected, 'conf', 0.0))):.2f}",
                     f"selected_depth: {float(msg_dict.get('depth_mm', 0.0)):.1f}",
-                    f"depth_source: {dbg.get('depth_source', 'window')}",
+                    f"depth_source: {msg_dict.get('depth_source', dbg.get('depth_source', 'window'))}",
                     f"color_mean_r: {float(dbg.get('mean_r', 0.0)):.1f}",
                     f"color_rg_delta: {float(dbg.get('mean_rg_delta', 0.0)):.1f}",
                     f"color_rb_delta: {float(dbg.get('mean_rb_delta', 0.0)):.1f}",

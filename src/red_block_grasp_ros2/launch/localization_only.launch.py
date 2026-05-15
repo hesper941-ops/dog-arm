@@ -2,6 +2,7 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -10,6 +11,7 @@ def generate_launch_description():
     model_path = LaunchConfiguration("model_path")
     handeye_path = LaunchConfiguration("handeye_path")
     arm_port = LaunchConfiguration("arm_port")
+    start_roarm_driver = LaunchConfiguration("start_roarm_driver")
     show_window = LaunchConfiguration("show_window")
     enable_fill_light = LaunchConfiguration("enable_fill_light")
     detector_mode = LaunchConfiguration("detector_mode")
@@ -26,11 +28,19 @@ def generate_launch_description():
     color_aspect_max = LaunchConfiguration("color_aspect_max")
     color_extent_min = LaunchConfiguration("color_extent_min")
     color_solidity_min = LaunchConfiguration("color_solidity_min")
+    color_min_valid_depth_count = LaunchConfiguration("color_min_valid_depth_count")
+    color_relative_area_min_ratio = LaunchConfiguration("color_relative_area_min_ratio")
+    color_locked_replace_min_area_ratio = LaunchConfiguration("color_locked_replace_min_area_ratio")
     enable_target_hold = LaunchConfiguration("enable_target_hold")
     target_hold_max_frames = LaunchConfiguration("target_hold_max_frames")
     target_hold_timeout_s = LaunchConfiguration("target_hold_timeout_s")
     target_hold_max_pixel_drift = LaunchConfiguration("target_hold_max_pixel_drift")
     target_hold_max_base_drift_mm = LaunchConfiguration("target_hold_max_base_drift_mm")
+    arm_state_source = LaunchConfiguration("arm_state_source")
+    official_get_pose_service = LaunchConfiguration("official_get_pose_service")
+    official_pose_position_scale = LaunchConfiguration("official_pose_position_scale")
+    official_pose_timeout_s = LaunchConfiguration("official_pose_timeout_s")
+    official_pose_poll_period_s = LaunchConfiguration("official_pose_poll_period_s")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -44,6 +54,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "arm_port",
             default_value="/dev/ttyUSB0",
+        ),
+        DeclareLaunchArgument(
+            "start_roarm_driver",
+            default_value="true",
         ),
         DeclareLaunchArgument(
             "show_window",
@@ -79,17 +93,26 @@ def generate_launch_description():
         DeclareLaunchArgument("color_aspect_max", default_value="3.0"),
         DeclareLaunchArgument("color_extent_min", default_value="0.25"),
         DeclareLaunchArgument("color_solidity_min", default_value="0.50"),
+        DeclareLaunchArgument("color_min_valid_depth_count", default_value="8"),
+        DeclareLaunchArgument("color_relative_area_min_ratio", default_value="0.25"),
+        DeclareLaunchArgument("color_locked_replace_min_area_ratio", default_value="0.30"),
         DeclareLaunchArgument("enable_target_hold", default_value="true"),
         DeclareLaunchArgument("target_hold_max_frames", default_value="5"),
         DeclareLaunchArgument("target_hold_timeout_s", default_value="0.6"),
         DeclareLaunchArgument("target_hold_max_pixel_drift", default_value="80.0"),
         DeclareLaunchArgument("target_hold_max_base_drift_mm", default_value="80.0"),
+        DeclareLaunchArgument("arm_state_source", default_value="dog_arm_topic"),
+        DeclareLaunchArgument("official_get_pose_service", default_value="/get_pose_cmd"),
+        DeclareLaunchArgument("official_pose_position_scale", default_value="1000.0"),
+        DeclareLaunchArgument("official_pose_timeout_s", default_value="0.5"),
+        DeclareLaunchArgument("official_pose_poll_period_s", default_value="0.1"),
 
         Node(
             package="red_block_grasp_ros2",
             executable="roarm_driver_node",
             name="roarm_driver_node",
             output="screen",
+            condition=IfCondition(start_roarm_driver),
             parameters=[
                 {
                     "port": arm_port,
@@ -128,11 +151,20 @@ def generate_launch_description():
                     "color_aspect_max": color_aspect_max,
                     "color_extent_min": color_extent_min,
                     "color_solidity_min": color_solidity_min,
+                    "color_min_valid_depth_count": color_min_valid_depth_count,
+                    "color_relative_area_min_ratio": color_relative_area_min_ratio,
+                    "color_locked_replace_min_area_ratio": color_locked_replace_min_area_ratio,
                     "enable_target_hold": enable_target_hold,
                     "target_hold_max_frames": target_hold_max_frames,
                     "target_hold_timeout_s": target_hold_timeout_s,
                     "target_hold_max_pixel_drift": target_hold_max_pixel_drift,
                     "target_hold_max_base_drift_mm": target_hold_max_base_drift_mm,
+                    # 官方 MoveIt2 工作流下可设 start_roarm_driver:=false，避免与官方 driver 抢占串口。
+                    "arm_state_source": arm_state_source,
+                    "official_get_pose_service": official_get_pose_service,
+                    "official_pose_position_scale": official_pose_position_scale,
+                    "official_pose_timeout_s": official_pose_timeout_s,
+                    "official_pose_poll_period_s": official_pose_poll_period_s,
                 }
             ],
         ),
