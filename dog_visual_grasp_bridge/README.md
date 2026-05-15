@@ -104,3 +104,20 @@ ros2 topic echo /red_block/base_adjust_request
 - `allow_snapshot_expire_during_motion` 默认值为 `true`。
 - 抓取流程一旦开始，桥接节点会使用已经冻结的 `snapshot` 完成当前单次抓取。
 - 这样可以避免机械臂运动过程中因为视觉短时丢目标或 `snapshot` 超时而中途进入 `RECOVER`。
+
+## 观察关节姿态
+
+- 旧的全局观察位不是 `xyz` 点，而是关节角姿态：`B=0`、`S=0`、`E=70`、`T=90`、`R=-90`。
+- 这个观察姿态是相机能看见箱子全局的前提。
+- `/move_line_cmd` 只用于后续 `pre_grasp / grasp / lift`，不用于观察位。
+
+根据官方文档，当前已确认：
+
+- `roarm_description display.launch.py` 的关节滑块会经由 `/joint_states` 控制真机。
+- 官方关节控制 topic 是 `/joint_states`。
+- 消息类型是 `sensor_msgs/msg/JointState`。
+- 关节角单位是 `rad`。
+
+桥接脚本现在支持在启动后先发布一次官方观察关节姿态，再等待 `observe_wait_s` 后进入 `WAIT_TARGET`。
+
+如果你在 X5 端已经确认了官方 URDF 的精确 joint names，可以直接在 `config/grasp_config.yaml` 里覆盖 `official_joint_names`。当前默认留空，脚本只发布 `position` 数组，不去猜测官方源码里的精确 joint name 字符串。

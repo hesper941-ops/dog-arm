@@ -9,6 +9,7 @@ from collections import deque
 import rclpy
 import yaml
 from rclpy.node import Node
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32, String
 
 from roarm_msgs.srv import MoveLineCmd
@@ -58,6 +59,13 @@ class VisualMoveItGraspNode(Node):
         self.sub_target = self.create_subscription(String, "/red_block/target_base", self.on_target_msg, 10)
         self.pub_gripper = self.create_publisher(Float32, "/gripper_cmd", 10)
         self.pub_base_adjust = self.create_publisher(String, self.cfg["base_adjust_topic"], 10)
+        self.pub_joint = None
+        if str(self.cfg.get("joint_command_mode", "official_joint_topic")).strip() == "official_joint_topic":
+            self.pub_joint = self.create_publisher(
+                JointState,
+                str(self.cfg.get("official_joint_topic", "/joint_states")).strip() or "/joint_states",
+                10,
+            )
         self.move_line_client = self.create_client(MoveLineCmd, "/move_line_cmd")
         self.timer = self.create_timer(0.1, self.on_timer)
 
@@ -71,6 +79,18 @@ class VisualMoveItGraspNode(Node):
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def float_cfg(self, key, default=0.0):
+        try:
+            return float(self.cfg.get(key, default))
+        except Exception:
+            return float(default)
+
+    def list_cfg(self, key):
+        value = self.cfg.get(key, [])
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        return []
 
     def set_state(self, new_state, reason=""):
         if self.state != new_state:
@@ -269,6 +289,57 @@ class VisualMoveItGraspNode(Node):
         self.target_buffer.clear()
         self.done_logged = False
 
+    @staticmethod
+    def deg_to_rad(value_deg):
+        return float(value_deg) * math.pi / 180.0
+
+    def build_observe_joint_message(self):
+        # 官方文档确认 display.launch.py 通过 joint_states / JointState 发送关节角，单位为弧度。
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        joint_names = self.list_cfg("official_joint_names")
+        if joint_names:
+            msg.name = joint_names
+        unit_mode = str(self.cfg.get("official_joint_units", "rad")).strip().lower()
+        raw_positions = [
+            self.float_cfg("observe_b_deg", 0.0),
+            self.float_cfg("observe_s_deg", 0.0),
+            self.float_cfg("observe_e_deg", 70.0),
+            self.float_cfg("observe_t_deg", 90.0),
+            self.float_cfg("observe_r_deg", -90.0),
+        ]
+        if unit_mode == "deg":
+            msg.position = [float(v) for v in raw_positions]
+        else:
+            msg.position = [self.deg_to_rad(v) for v in raw_positions]
+        return msg
+
+    def move_to_observe_joint_pose(self):
+        if str(self.cfg.get("joint_command_mode", "official_joint_topic")).strip() != "official_joint_topic":
+            self.get_logger().error("未确认可靠的官方关节控制接口，不能自动回观察关节姿态")
+            return False
+        if self.pub_joint is None:
+            self.get_logger().error("官方关节控制 topic 未初始化，不能自动回观察关节姿态")
+            return False
+
+        msg = self.build_observe_joint_message()
+        topic_name = str(self.cfg.get("official_joint_topic", "/joint_states")).strip() or "/joint_states"
+        unit_mode = str(self.cfg.get("official_joint_units", "rad")).strip().lower()
+        self.get_logger().info(
+            "发布观察关节姿态到官方 topic: "
+            f"topic={topic_name}, unit={unit_mode}, position={list(msg.position)}"
+        )
+        if self.bool_cfg("dry_run"):
+            self.get_logger().info("MOVE_TO_OBSERVE_JOINT_POSE: dry_run=true，仅打印，不发布关节角")
+            return True
+
+        try:
+            self.pub_joint.publish(msg)
+            return True
+        except Exception as exc:
+            self.get_logger().error(f"发布观察关节姿态失败: {exc}")
+            return False
+
     def to_moveit_xyz(self, x_mm, y_mm, z_mm):
         scale = float(self.cfg["moveit_position_scale"])
         x_m = float(self.cfg["moveit_x_sign"]) * float(x_mm) * scale + float(self.cfg["moveit_x_offset_m"])
@@ -337,7 +408,21 @@ class VisualMoveItGraspNode(Node):
 
         if self.state == "IDLE":
             if self.bool_cfg("auto_start"):
-                self.set_state("WAIT_TARGET", "auto_start=true")
+                if self.bool_cfg("move_to_observe_joint_pose_on_start"):
+                    self.set_state("MOVE_TO_OBSERVE_JOINT_POSE", "auto_start=true")
+                else:
+                    self.set_state("WAIT_TARGET", "auto_start=true")
+            return
+
+        if self.state == "MOVE_TO_OBSERVE_JOINT_POSE":
+            if not self.state_action_done:
+                ok = self.move_to_observe_joint_pose()
+                if not ok:
+                    self.set_state("RECOVER", "观察关节姿态发布失败")
+                    return
+                self.state_action_done = True
+            if now - self.state_enter_time >= self.float_cfg("observe_wait_s", 3.0):
+                self.set_state("WAIT_TARGET", "观察关节姿态等待完成")
             return
 
         if self.state == "WAIT_TARGET":

@@ -28,6 +28,21 @@ stable_target_max_position_std_mm: 30.0
 stage_target_max_age_s: 3.0
 allow_snapshot_expire_during_motion: true
 
+move_to_observe_joint_pose_on_start: true
+observe_b_deg: 0.0
+observe_s_deg: 0.0
+observe_e_deg: 70.0
+observe_t_deg: 90.0
+observe_r_deg: -90.0
+observe_joint_speed_deg_s: 35.0
+observe_joint_acc: 35.0
+observe_wait_s: 3.0
+
+joint_command_mode: official_joint_topic
+official_joint_topic: /joint_states
+official_joint_names: []
+official_joint_units: rad
+
 gripper_open_value: 1.5
 gripper_close_value: 0.7
 gripper_close_value_strong: 0.5
