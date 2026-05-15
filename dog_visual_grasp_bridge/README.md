@@ -97,3 +97,10 @@ ros2 topic echo /red_block/base_adjust_request
 - 当前第一版只支持单个红块抓取
 - 两个红块连续抓取后续再做
 - 箱子 ROI / slot 后续再做
+
+## snapshot 过期策略
+
+- `stage_target_max_age_s` 只用于开始抓取前的目标新鲜度检查。
+- `allow_snapshot_expire_during_motion` 默认值为 `true`。
+- 抓取流程一旦开始，桥接节点会使用已经冻结的 `snapshot` 完成当前单次抓取。
+- 这样可以避免机械臂运动过程中因为视觉短时丢目标或 `snapshot` 超时而中途进入 `RECOVER`。

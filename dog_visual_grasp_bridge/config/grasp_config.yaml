@@ -26,6 +26,7 @@ workspace_z_max_mm: 330.0
 stable_target_min_frames: 3
 stable_target_max_position_std_mm: 30.0
 stage_target_max_age_s: 3.0
+allow_snapshot_expire_during_motion: true
 
 gripper_open_value: 1.5
 gripper_close_value: 0.7

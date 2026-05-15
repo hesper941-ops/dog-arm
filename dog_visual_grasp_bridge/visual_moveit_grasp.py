@@ -47,6 +47,13 @@ class VisualMoveItGraspNode(Node):
         self.state_action_done = False
         self.base_adjust_sent_at = 0.0
         self.done_logged = False
+        self.motion_states = {
+            "OPEN_GRIPPER",
+            "MOVE_TO_PRE_GRASP",
+            "MOVE_LINE_TO_GRASP",
+            "CLOSE_GRIPPER",
+            "LIFT",
+        }
 
         self.sub_target = self.create_subscription(String, "/red_block/target_base", self.on_target_msg, 10)
         self.pub_gripper = self.create_publisher(Float32, "/gripper_cmd", 10)
@@ -247,6 +254,16 @@ class VisualMoveItGraspNode(Node):
             )
         return expired
 
+    def allow_expired_snapshot_in_current_state(self):
+        if self.state not in self.motion_states:
+            return False
+        if not self.bool_cfg("allow_snapshot_expire_during_motion"):
+            return False
+        self.get_logger().warn(
+            "snapshot expired by age but allowed during current motion stage"
+        )
+        return True
+
     def clear_snapshot(self):
         self.current_snapshot = None
         self.target_buffer.clear()
@@ -342,8 +359,9 @@ class VisualMoveItGraspNode(Node):
             return
 
         if self.snapshot_expired():
-            self.set_state("RECOVER", "snapshot 已过期")
-            return
+            if not self.allow_expired_snapshot_in_current_state():
+                self.set_state("RECOVER", "snapshot 已过期")
+                return
 
         target_x = float(self.current_snapshot["x_mm"])
         target_y = float(self.current_snapshot["y_mm"])
@@ -396,6 +414,7 @@ class VisualMoveItGraspNode(Node):
             if not self.done_logged:
                 self.get_logger().info("抓取流程完成。当前第一版仅执行单个红块抓取。")
                 self.done_logged = True
+            self.clear_snapshot()
             return
 
         if self.state == "RECOVER":
