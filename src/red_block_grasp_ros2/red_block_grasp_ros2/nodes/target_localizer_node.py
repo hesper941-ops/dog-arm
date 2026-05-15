@@ -49,6 +49,8 @@ class TargetLocalizerNode(Node):
         self.declare_parameter("stable_position_threshold_mm", 20.0)
         self.declare_parameter("stable_depth_threshold_mm", 30.0)
         self.declare_parameter("publish_only_stable", False)
+        self.declare_parameter("target_lock_timeout_s", 1.0)
+        self.declare_parameter("fusion_min_color_to_yolo_area_ratio", 0.45)
 
         self.declare_parameter("color_min_depth_mm", 100.0)
         self.declare_parameter("color_max_depth_mm", 700.0)
@@ -113,6 +115,10 @@ class TargetLocalizerNode(Node):
         self.stable_position_threshold_mm = float(self.get_parameter("stable_position_threshold_mm").value)
         self.stable_depth_threshold_mm = float(self.get_parameter("stable_depth_threshold_mm").value)
         self.publish_only_stable = self.parse_bool(self.get_parameter("publish_only_stable").value)
+        self.target_lock_timeout_s = float(self.get_parameter("target_lock_timeout_s").value)
+        self.fusion_min_color_to_yolo_area_ratio = float(
+            self.get_parameter("fusion_min_color_to_yolo_area_ratio").value
+        )
 
         self.safe_roi_x_min_ratio = float(self.get_parameter("safe_roi_x_min_ratio").value)
         self.safe_roi_x_max_ratio = float(self.get_parameter("safe_roi_x_max_ratio").value)
@@ -140,6 +146,7 @@ class TargetLocalizerNode(Node):
         self.latest_arm_state = None
         self.latest_arm_state_time = 0.0
         self.locked_pixel = None
+        self.lock_last_seen_time = 0.0
         self.filtered_base = None
         self.stable_window = deque(maxlen=self.stable_frame_count)
         self.frame_index = 0
@@ -373,22 +380,44 @@ class TargetLocalizerNode(Node):
         area_b = max(1, (b.x2 - b.x1) * (b.y2 - b.y1))
         return float(inter) / float(area_a + area_b - inter)
 
-    def select_detection(self, detections, image_width, image_height):
+    @staticmethod
+    def bbox_area(det):
+        return max(1, int(det.x2 - det.x1) * int(det.y2 - det.y1))
+
+    def clear_target_lock(self):
+        self.locked_pixel = None
+        self.lock_last_seen_time = 0.0
+        self.filtered_base = None
+        self.stable_window.clear()
+
+    def target_lock_active(self, now):
+        return (
+            self.enable_target_lock
+            and self.locked_pixel is not None
+            and (now - self.lock_last_seen_time) <= self.target_lock_timeout_s
+        )
+
+    def select_detection(self, detections, image_width, image_height, now=None):
+        if now is None:
+            now = time.time()
         if not detections:
-            self.locked_pixel = None
-            self.filtered_base = None
+            if self.locked_pixel is not None and not self.target_lock_active(now):
+                self.clear_target_lock()
             return None, "no_detection"
 
         safe = [det for det in detections if self.detection_in_safe_roi(det, image_width, image_height)]
         if not safe:
-            self.locked_pixel = None
-            self.filtered_base = None
+            if self.locked_pixel is not None and not self.target_lock_active(now):
+                self.clear_target_lock()
             return None, "no_safe_detection"
 
-        if self.enable_target_lock and self.locked_pixel is not None:
+        if self.target_lock_active(now):
             nearest = min(safe, key=lambda det: self.pixel_distance(det.center, self.locked_pixel))
             if self.pixel_distance(nearest.center, self.locked_pixel) <= self.lock_max_pixel_jump:
                 return nearest, "locked_target"
+            return None, "locked_target_wait_timeout"
+        elif self.locked_pixel is not None:
+            self.clear_target_lock()
 
         img_cx = image_width / 2.0
         img_cy = image_height / 2.0
@@ -401,31 +430,59 @@ class TargetLocalizerNode(Node):
 
         return max(safe, key=score), "new_target"
 
-    def select_fusion_detection(self, color_detections, yolo_detections, image_width, image_height):
+    def annotate_color_with_yolo_support(self, color_detections, yolo_detections):
+        for det in color_detections:
+            det.debug_info["best_yolo_iou"] = 0.0
+            det.debug_info["best_yolo_area_ratio"] = None
+            det.debug_info["fusion_small_local"] = False
+            if not yolo_detections:
+                continue
+
+            best_yolo = max(yolo_detections, key=lambda ydet: self.bbox_iou(det, ydet))
+            best_iou = self.bbox_iou(det, best_yolo)
+            det.debug_info["best_yolo_iou"] = float(best_iou)
+            yolo_area = float(self.bbox_area(best_yolo))
+            color_area = float(self.bbox_area(det))
+            area_ratio = color_area / max(yolo_area, 1.0)
+            det.debug_info["best_yolo_area_ratio"] = float(area_ratio)
+            det.debug_info["fusion_small_local"] = bool(
+                best_iou >= self.fusion_iou_threshold and area_ratio < self.fusion_min_color_to_yolo_area_ratio
+            )
+
+    def select_fusion_detection(self, color_detections, yolo_detections, image_width, image_height, now=None):
+        if now is None:
+            now = time.time()
         if self.detector_mode == "color":
-            selected, reason = self.select_detection(color_detections, image_width, image_height)
+            selected, reason = self.select_detection(color_detections, image_width, image_height, now=now)
             return selected, reason, "color"
 
         if self.detector_mode == "yolo":
-            selected, reason = self.select_detection(yolo_detections, image_width, image_height)
+            selected, reason = self.select_detection(yolo_detections, image_width, image_height, now=now)
             return selected, reason, "yolo"
 
-        if color_detections and yolo_detections:
-            matched = []
-            for cdet in color_detections:
-                best_iou = max(self.bbox_iou(cdet, ydet) for ydet in yolo_detections)
-                if best_iou >= self.fusion_iou_threshold:
-                    matched.append((cdet, best_iou))
-            if matched:
-                matched.sort(key=lambda item: float(getattr(item[0], "score", item[0].conf)) + item[1], reverse=True)
-                selected, reason = self.select_detection([item[0] for item in matched], image_width, image_height)
-                return selected, "fusion_color_yolo_iou" if selected is not None else reason, "fusion"
+        self.annotate_color_with_yolo_support(color_detections, yolo_detections)
+
+        preferred_color = [det for det in color_detections if not det.debug_info.get("fusion_small_local", False)]
+        if preferred_color:
+            selected, reason = self.select_detection(preferred_color, image_width, image_height, now=now)
+            if selected is not None:
+                return selected, "fusion_color_primary" if reason == "new_target" else reason, "color"
 
         if color_detections:
-            selected, reason = self.select_detection(color_detections, image_width, image_height)
-            return selected, "fusion_color_only" if selected is not None else reason, "color"
+            selected, reason = self.select_detection(color_detections, image_width, image_height, now=now)
+            if selected is not None and not selected.debug_info.get("fusion_small_local", False):
+                return selected, "fusion_color_only" if reason == "new_target" else reason, "color"
 
-        selected, reason = self.select_detection(yolo_detections, image_width, image_height)
+        if yolo_detections:
+            selected, reason = self.select_detection(yolo_detections, image_width, image_height, now=now)
+            if selected is not None and color_detections:
+                return selected, "fusion_yolo_color_confirm" if reason == "new_target" else reason, "yolo_assisted"
+
+        if color_detections:
+            selected, reason = self.select_detection(color_detections, image_width, image_height, now=now)
+            return selected, "fusion_color_local_only" if selected is not None else reason, "color_local"
+
+        selected, reason = self.select_detection(yolo_detections, image_width, image_height, now=now)
         return selected, "fusion_yolo_fallback" if selected is not None else reason, "yolo_fallback"
 
     def filter_base(self, base):
@@ -528,7 +585,7 @@ class TargetLocalizerNode(Node):
         infer_done = time.time()
 
         selected, select_reason, source = self.select_fusion_detection(
-            color_detections, yolo_detections, image_width, image_height
+            color_detections, yolo_detections, image_width, image_height, now=now
         )
 
         msg_dict = self.empty_message(now, "", select_reason, image_width, image_height)
@@ -547,12 +604,18 @@ class TargetLocalizerNode(Node):
             msg_dict["reason"] = select_reason
             self.stable_window.clear()
         elif self.latest_arm_state is None:
+            self.locked_pixel = selected.center
+            self.lock_last_seen_time = now
             msg_dict["reason"] = "no_arm_state"
             self.stable_window.clear()
         elif now - self.latest_arm_state_time > 1.0:
+            self.locked_pixel = selected.center
+            self.lock_last_seen_time = now
             msg_dict["reason"] = "arm_state_timeout"
             self.stable_window.clear()
         else:
+            self.locked_pixel = selected.center
+            self.lock_last_seen_time = now
             location = self.localizer.localize(selected, bgr, depth_mm, camera_matrix, self.latest_arm_state)
             if location is None:
                 msg_dict["reason"] = "invalid_depth"
@@ -562,9 +625,6 @@ class TargetLocalizerNode(Node):
                 filtered_base = self.filter_base(raw_base)
                 stable, stable_frames, stable_base = self.update_stability(filtered_base, location["depth_mm"])
                 output_base = stable_base if stable else filtered_base
-                cx, cy = selected.center
-                self.locked_pixel = (cx, cy)
-
                 msg_dict.update(
                     {
                         "valid": True,
@@ -667,17 +727,62 @@ class TargetLocalizerNode(Node):
             2,
         )
 
-        for det in yolo_detections:
+        for idx, det in enumerate(yolo_detections):
             cv2.rectangle(display, (det.x1, det.y1), (det.x2, det.y2), (255, 0, 0), 2)
-        for det in color_detections:
+            label = f"YOLO#{idx} conf={float(getattr(det, 'conf', 0.0)):.2f}"
+            cv2.putText(
+                display,
+                label,
+                (det.x1, max(18, det.y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 0, 0),
+                2,
+            )
+        for idx, det in enumerate(color_detections):
             is_selected = selected is det
-            color = (0, 255, 255) if is_selected else (0, 0, 255)
+            color = (0, 255, 255) if is_selected else (0, 165, 255)
             cv2.rectangle(display, (det.x1, det.y1), (det.x2, det.y2), color, 3 if is_selected else 2)
             cv2.circle(display, det.center, 5, color, -1)
+            det_area = float(det.debug_info.get("area", self.bbox_area(det)))
+            label = (
+                f"COLOR#{idx} s={float(getattr(det, 'score', getattr(det, 'conf', 0.0))):.2f} "
+                f"a={det_area:.0f}"
+            )
+            if det.debug_info.get("fusion_small_local", False):
+                label += " local"
+            cv2.putText(
+                display,
+                label,
+                (det.x1, min(image_height - 8, det.y2 + 16 if det.y1 < 24 else det.y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                2,
+            )
 
         if selected is not None and all(selected is not det for det in color_detections):
             cv2.rectangle(display, (selected.x1, selected.y1), (selected.x2, selected.y2), (0, 255, 255), 3)
             cv2.circle(display, selected.center, 5, (0, 255, 255), -1)
+            cv2.putText(
+                display,
+                "SELECTED target",
+                (selected.x1, max(18, selected.y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (0, 255, 255),
+                2,
+            )
+        elif selected is not None:
+            cv2.putText(
+                display,
+                "SELECTED target",
+                (selected.x1, max(18, selected.y1 - 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (0, 255, 255),
+                2,
+            )
 
         if msg_dict.get("valid", False):
             base = msg_dict["base_mm"]
@@ -686,6 +791,16 @@ class TargetLocalizerNode(Node):
                 f"base=({base['x']:.1f},{base['y']:.1f},{base['z']:.1f})"
             )
             cv2.putText(display, text, (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+            if selected is not None:
+                dbg = getattr(selected, "debug_info", {})
+                detail = (
+                    f"sel area={float(dbg.get('area', self.bbox_area(selected))):.0f} "
+                    f"extent={float(dbg.get('extent', 0.0)):.2f} "
+                    f"sol={float(dbg.get('solidity', 0.0)):.2f} "
+                    f"depth={dbg.get('depth_source', 'window')} "
+                    f"score={float(getattr(selected, 'score', getattr(selected, 'conf', 0.0))):.2f}"
+                )
+                cv2.putText(display, detail, (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
         else:
             cv2.putText(
                 display,

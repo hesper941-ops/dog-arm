@@ -94,9 +94,23 @@ class RedColorBlockDetector:
         self.max_targets = int(max_targets)
 
     @staticmethod
+    def _clamp01(value):
+        return max(0.0, min(1.0, float(value)))
+
+    @staticmethod
     def _odd(value):
         value = int(max(1, value))
         return value if value % 2 == 1 else value + 1
+
+    def remove_small_components(self, binary, min_area):
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        cleaned = np.zeros(binary.shape, dtype=np.uint8)
+        min_area_int = max(1, int(round(float(min_area))))
+        for label in range(1, num_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area >= min_area_int:
+                cleaned[labels == label] = 255
+        return cleaned
 
     def build_mask(self, bgr_image):
         blurred = cv2.GaussianBlur(bgr_image, (5, 5), 0)
@@ -133,12 +147,21 @@ class RedColorBlockDetector:
         mask = cv2.bitwise_and(hsv_mask, aux_mask)
         mask = cv2.medianBlur(mask, self._odd(self.morph_kernel_size))
 
-        kernel = cv2.getStructuringElement(
+        kernel_open = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (self._odd(self.morph_kernel_size), self._odd(self.morph_kernel_size)),
         )
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        close_size = self._odd(max(self.morph_kernel_size + 2, int(round(self.morph_kernel_size * 1.5))))
+        kernel_close = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (close_size, close_size),
+        )
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+        mask = cv2.dilate(mask, kernel_dilate, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
         return mask
 
     def _scale_mask_to_depth(self, mask, depth_shape):
@@ -190,9 +213,14 @@ class RedColorBlockDetector:
 
         values = depth_mm[eroded > 0]
         valid = self._valid_depths(values)
+        if valid.size >= 12:
+            return float(np.median(valid)), True, {
+                "depth_source": "eroded_mask_median",
+                "valid_depth_count": int(valid.size),
+            }
         if valid.size >= 8:
             return float(np.median(valid)), True, {
-                "depth_source": "mask",
+                "depth_source": "mask_median",
                 "valid_depth_count": int(valid.size),
             }
 
@@ -209,12 +237,65 @@ class RedColorBlockDetector:
             "valid_depth_count": int(valid.size),
         }
 
-    def _candidate_score(self, area, area_limit, color_ratio, extent, solidity, depth_valid):
-        area_score = min(1.0, float(area) / max(float(area_limit) * 0.18, 1.0))
-        color_score = min(1.0, max(0.0, float(color_ratio)))
-        shape_score = 0.5 * min(1.0, float(extent)) + 0.5 * min(1.0, float(solidity))
-        depth_score = 1.0 if depth_valid else 0.2
-        return 0.35 * area_score + 0.30 * color_score + 0.25 * shape_score + 0.10 * depth_score
+    def validate_color_means(self, mean_bgr, mean_hsv, mean_lab):
+        mean_b = float(mean_bgr[0])
+        mean_g = float(mean_bgr[1])
+        mean_r = float(mean_bgr[2])
+        mean_s = float(mean_hsv[1])
+        mean_v = float(mean_hsv[2])
+        mean_a = float(mean_lab[1])
+
+        checks = {
+            "mean_r_ok": mean_r >= max(70.0, float(self.bgr_r_min) * 0.95),
+            "mean_s_ok": mean_s >= max(45.0, float(self.hsv_s_min) * 0.70),
+            "mean_v_ok": mean_v >= max(45.0, float(self.hsv_v_min) * 0.85),
+            "mean_rg_ok": (mean_r - mean_g) >= max(18.0, float(self.bgr_rg_delta) * 0.75),
+            "mean_rb_ok": (mean_r - mean_b) >= max(15.0, float(self.bgr_rb_delta) * 0.75),
+            "mean_lab_a_ok": mean_a >= max(140.0, float(self.lab_a_min) - 8.0),
+        }
+        return all(checks.values()), {
+            "mean_b": mean_b,
+            "mean_g": mean_g,
+            "mean_r": mean_r,
+            "mean_s": mean_s,
+            "mean_v": mean_v,
+            "mean_lab_a": mean_a,
+            **checks,
+        }
+
+    def _candidate_score(self, area, min_area, max_area, color_ratio, extent, solidity, rr_extent, rr_ratio, depth_valid, color_stats):
+        area_floor = max(float(min_area), 1.0)
+        area_mid = max(area_floor * 2.5, float(max_area) * 0.10)
+        area_score = self._clamp01(float(area) / area_mid)
+
+        color_score = np.mean(
+            [
+                self._clamp01((float(color_stats["mean_r"]) - max(70.0, float(self.bgr_r_min) * 0.95)) / 90.0),
+                self._clamp01((float(color_stats["mean_s"]) - max(45.0, float(self.hsv_s_min) * 0.70)) / 80.0),
+                self._clamp01((float(color_stats["mean_v"]) - max(45.0, float(self.hsv_v_min) * 0.85)) / 80.0),
+                self._clamp01((float(color_stats["mean_r"]) - float(color_stats["mean_g"]) - max(18.0, float(self.bgr_rg_delta) * 0.75)) / 70.0),
+                self._clamp01((float(color_stats["mean_r"]) - float(color_stats["mean_b"]) - max(15.0, float(self.bgr_rb_delta) * 0.75)) / 70.0),
+                self._clamp01((float(color_stats["mean_lab_a"]) - max(140.0, float(self.lab_a_min) - 8.0)) / 40.0),
+                self._clamp01(color_ratio),
+            ]
+        )
+        rr_ratio_score = self._clamp01((2.6 - float(rr_ratio)) / 1.6)
+        shape_score = np.mean(
+            [
+                self._clamp01(extent),
+                self._clamp01(solidity),
+                self._clamp01(rr_extent),
+                rr_ratio_score,
+            ]
+        )
+        depth_score = 1.0 if depth_valid else 0.15
+        total = 0.26 * area_score + 0.30 * color_score + 0.32 * shape_score + 0.12 * depth_score
+        return float(total), {
+            "area_score": float(area_score),
+            "color_score": float(color_score),
+            "shape_score": float(shape_score),
+            "depth_score": float(depth_score),
+        }
 
     def detect(self, bgr_image, depth_mm=None, camera_matrix=None):
         del camera_matrix
@@ -226,6 +307,10 @@ class RedColorBlockDetector:
         min_area = max(self.min_area, image_area * self.min_area_ratio)
         max_area = image_area * self.max_area_ratio
         mask = self.build_mask(bgr_image)
+        mask = self.remove_small_components(mask, min_area)
+        blur = cv2.GaussianBlur(bgr_image, (5, 5), 0)
+        hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         detections = []
@@ -260,6 +345,21 @@ class RedColorBlockDetector:
             if solidity < self.solidity_min:
                 continue
 
+            rr = cv2.minAreaRect(contour)
+            rr_w = max(float(rr[1][0]), float(rr[1][1]))
+            rr_h = min(float(rr[1][0]), float(rr[1][1]))
+            if rr_w <= 1.0 or rr_h <= 1.0:
+                continue
+            rr_ratio = rr_w / rr_h
+            rr_ratio_min = max(1.0, min(self.aspect_min, 1.0))
+            rr_ratio_max = max(2.30, min(3.2, self.aspect_max + 0.35))
+            if rr_ratio < rr_ratio_min or rr_ratio > rr_ratio_max:
+                continue
+            rr_area = rr_w * rr_h
+            rr_extent = area / max(rr_area, 1.0)
+            if rr_extent < max(0.45, self.extent_min + 0.18):
+                continue
+
             perimeter = float(cv2.arcLength(contour, True))
             circularity = 0.0
             if perimeter > 1e-6:
@@ -270,7 +370,23 @@ class RedColorBlockDetector:
             candidate_mask = np.zeros((image_h, image_w), dtype=np.uint8)
             cv2.drawContours(candidate_mask, [contour], -1, 255, thickness=-1)
             color_ratio = float(np.count_nonzero(cv2.bitwise_and(mask, candidate_mask))) / max(area, 1.0)
-            center = (int(x + w / 2), int(y + h / 2))
+            moments = cv2.moments(contour)
+            if abs(moments["m00"]) > 1e-6:
+                center = (int(round(moments["m10"] / moments["m00"])), int(round(moments["m01"] / moments["m00"])))
+            else:
+                center = (int(round(rr[0][0])), int(round(rr[0][1])))
+            center = (
+                max(0, min(center[0], image_w - 1)),
+                max(0, min(center[1], image_h - 1)),
+            )
+
+            mean_bgr = cv2.mean(blur, candidate_mask)
+            mean_hsv = cv2.mean(hsv, candidate_mask)
+            mean_lab = cv2.mean(lab, candidate_mask)
+            color_valid, color_stats = self.validate_color_means(mean_bgr, mean_hsv, mean_lab)
+            if not color_valid:
+                continue
+
             depth, valid_depth, depth_info = self.robust_depth_from_mask(
                 depth_mm=depth_mm,
                 candidate_mask=candidate_mask,
@@ -278,7 +394,18 @@ class RedColorBlockDetector:
                 image_shape=bgr_image.shape,
             )
 
-            score = self._candidate_score(area, max_area, color_ratio, extent, solidity, valid_depth)
+            score, score_parts = self._candidate_score(
+                area=area,
+                min_area=min_area,
+                max_area=max_area,
+                color_ratio=color_ratio,
+                extent=extent,
+                solidity=solidity,
+                rr_extent=rr_extent,
+                rr_ratio=rr_ratio,
+                depth_valid=valid_depth,
+                color_stats=color_stats,
+            )
             detections.append(
                 RedColorDetection(
                     class_id=0,
@@ -295,11 +422,18 @@ class RedColorBlockDetector:
                     score=float(score),
                     debug_info={
                         "area": area,
+                        "bbox_area": bbox_area,
                         "aspect": aspect,
                         "extent": extent,
                         "solidity": solidity,
+                        "rr_width": rr_w,
+                        "rr_height": rr_h,
+                        "rr_ratio": rr_ratio,
+                        "rr_extent": rr_extent,
                         "circularity": circularity,
                         "color_ratio": color_ratio,
+                        **color_stats,
+                        **score_parts,
                         **depth_info,
                     },
                 )
