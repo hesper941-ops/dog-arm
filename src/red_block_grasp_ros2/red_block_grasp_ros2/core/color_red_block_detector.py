@@ -63,6 +63,7 @@ class RedColorBlockDetector:
         bgr_rg_delta=35,
         bgr_rb_delta=25,
         bgr_b_max=210,
+        min_valid_depth_count=8,
         max_targets=4,
     ):
         self.min_depth_mm = float(min_depth_mm)
@@ -91,6 +92,7 @@ class RedColorBlockDetector:
         self.bgr_rg_delta = int(bgr_rg_delta)
         self.bgr_rb_delta = int(bgr_rb_delta)
         self.bgr_b_max = int(bgr_b_max)
+        self.min_valid_depth_count = int(max(1, min_valid_depth_count))
         self.max_targets = int(max_targets)
 
     @staticmethod
@@ -267,8 +269,8 @@ class RedColorBlockDetector:
 
         valid = self._valid_depths(depth_mm[v0:v1, u0:u1])
         if valid.size == 0:
-            return None
-        return float(np.median(valid))
+            return None, 0
+        return float(np.median(valid)), int(valid.size)
 
     def robust_depth_from_mask(self, depth_mm, candidate_mask, center, image_shape):
         if depth_mm is None:
@@ -285,23 +287,23 @@ class RedColorBlockDetector:
 
         values = depth_mm[eroded > 0]
         valid = self._valid_depths(values)
-        if valid.size >= 12:
+        if valid.size >= max(12, self.min_valid_depth_count):
             return float(np.median(valid)), True, {
                 "depth_source": "eroded_mask_median",
                 "valid_depth_count": int(valid.size),
             }
-        if valid.size >= 8:
+        if valid.size >= self.min_valid_depth_count:
             return float(np.median(valid)), True, {
                 "depth_source": "mask_median",
                 "valid_depth_count": int(valid.size),
             }
 
         for radius in (3, 5, 7):
-            depth = self._window_depth(depth_mm, center, image_shape, radius)
-            if depth is not None:
+            depth, valid_count = self._window_depth(depth_mm, center, image_shape, radius)
+            if depth is not None and valid_count >= self.min_valid_depth_count:
                 return depth, True, {
                     "depth_source": f"center_window_{radius}",
-                    "valid_depth_count": int(valid.size),
+                    "valid_depth_count": int(valid_count),
                 }
 
         return None, False, {
@@ -486,6 +488,7 @@ class RedColorBlockDetector:
                 depth_valid=valid_depth,
                 color_stats=color_stats,
             )
+            visibility_score = self._clamp01(area / max(max_area, 1.0))
             detections.append(
                 RedColorDetection(
                     class_id=0,
@@ -512,6 +515,8 @@ class RedColorBlockDetector:
                         "rr_extent": rr_extent,
                         "circularity": circularity,
                         "color_ratio": color_ratio,
+                        "mask_area": area,
+                        "visibility_score": visibility_score,
                         **color_stats,
                         **score_parts,
                         **depth_info,

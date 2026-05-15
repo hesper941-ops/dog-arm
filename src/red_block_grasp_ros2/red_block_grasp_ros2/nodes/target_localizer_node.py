@@ -80,6 +80,9 @@ class TargetLocalizerNode(Node):
         self.declare_parameter("color_bgr_rg_delta", 35)
         self.declare_parameter("color_bgr_rb_delta", 25)
         self.declare_parameter("color_bgr_b_max", 210)
+        self.declare_parameter("color_min_valid_depth_count", 8)
+        self.declare_parameter("color_relative_area_min_ratio", 0.25)
+        self.declare_parameter("color_locked_replace_min_area_ratio", 0.30)
 
         self.declare_parameter("safe_roi_x_min_ratio", 0.12)
         self.declare_parameter("safe_roi_x_max_ratio", 0.88)
@@ -159,6 +162,7 @@ class TargetLocalizerNode(Node):
         self.latest_arm_state_time = 0.0
         self.locked_pixel = None
         self.lock_last_seen_time = 0.0
+        self.locked_area = None
         self.filtered_base = None
         self.stable_window = deque(maxlen=self.stable_frame_count)
         self.frame_index = 0
@@ -211,6 +215,7 @@ class TargetLocalizerNode(Node):
                 bgr_rg_delta=self.color_params["color_bgr_rg_delta"],
                 bgr_rb_delta=self.color_params["color_bgr_rb_delta"],
                 bgr_b_max=self.color_params["color_bgr_b_max"],
+                min_valid_depth_count=self.color_params["color_min_valid_depth_count"],
                 max_targets=self.max_targets,
             )
             self.log_color_params()
@@ -264,6 +269,7 @@ class TargetLocalizerNode(Node):
             "color_bgr_rg_delta": int(self.get_parameter("color_bgr_rg_delta").value),
             "color_bgr_rb_delta": int(self.get_parameter("color_bgr_rb_delta").value),
             "color_bgr_b_max": int(self.get_parameter("color_bgr_b_max").value),
+            "color_min_valid_depth_count": int(self.get_parameter("color_min_valid_depth_count").value),
             "color_min_area": float(self.get_parameter("color_min_area").value),
             "color_min_area_ratio": float(self.get_parameter("color_min_area_ratio").value),
             "color_max_area_ratio": float(self.get_parameter("color_max_area_ratio").value),
@@ -273,6 +279,10 @@ class TargetLocalizerNode(Node):
             "color_solidity_min": float(self.get_parameter("color_solidity_min").value),
             "color_morph_kernel_size": int(self.get_parameter("color_morph_kernel_size").value),
             "color_erode_kernel_size": int(self.get_parameter("color_erode_kernel_size").value),
+            "color_relative_area_min_ratio": float(self.get_parameter("color_relative_area_min_ratio").value),
+            "color_locked_replace_min_area_ratio": float(
+                self.get_parameter("color_locked_replace_min_area_ratio").value
+            ),
             "color_min_depth_mm": float(self.get_parameter("color_min_depth_mm").value),
             "color_max_depth_mm": float(self.get_parameter("color_max_depth_mm").value),
         }
@@ -407,6 +417,7 @@ class TargetLocalizerNode(Node):
         # 锁丢失后一起清理滤波状态，避免两个红块的 base 坐标混在同一窗口里。
         self.locked_pixel = None
         self.lock_last_seen_time = 0.0
+        self.locked_area = None
         self.filtered_base = None
         self.stable_window.clear()
 
@@ -485,6 +496,16 @@ class TargetLocalizerNode(Node):
 
         if self.target_lock_active(now):
             nearest = min(safe, key=lambda det: self.pixel_distance(det.center, self.locked_pixel))
+            nearest_debug = getattr(nearest, "debug_info", {})
+            nearest_area = float(nearest_debug.get("area", self.bbox_area(nearest)))
+            min_replace_ratio = float(self.color_params.get("color_locked_replace_min_area_ratio", 0.30))
+            if (
+                self.locked_area is not None
+                and nearest_area < float(self.locked_area) * min_replace_ratio
+            ):
+                if hasattr(nearest, "debug_info"):
+                    nearest.debug_info["rejected_locked_area"] = True
+                return None, "locked_target_small_area"
             if self.pixel_distance(nearest.center, self.locked_pixel) <= self.lock_max_pixel_jump:
                 return nearest, "locked_target"
             return None, "locked_target_wait_timeout"
@@ -501,6 +522,35 @@ class TargetLocalizerNode(Node):
             return det_score - self.center_weight * (math.hypot(cx - img_cx, cy - img_cy) / norm)
 
         return max(safe, key=score), "new_target"
+
+    def summarize_color_candidates(self, color_detections):
+        if not color_detections:
+            return {
+                "max_candidate_area": 0.0,
+                "rejected_small_area_count": 0,
+                "color_candidates_filtered": [],
+            }
+        max_candidate_area = max(float(det.debug_info.get("area", self.bbox_area(det))) for det in color_detections)
+        min_ratio = float(self.color_params.get("color_relative_area_min_ratio", 0.25))
+        min_area_allowed = max_candidate_area * min_ratio
+        filtered = []
+        rejected_small_area_count = 0
+        for det in color_detections:
+            area = float(det.debug_info.get("area", self.bbox_area(det)))
+            visibility_score = 0.0 if max_candidate_area <= 1e-6 else area / max_candidate_area
+            det.debug_info["max_candidate_area"] = float(max_candidate_area)
+            det.debug_info["visibility_score"] = float(visibility_score)
+            det.debug_info["area_ratio_to_max"] = float(visibility_score)
+            det.debug_info["rejected_small_area"] = bool(area < min_area_allowed)
+            if area < min_area_allowed:
+                rejected_small_area_count += 1
+                continue
+            filtered.append(det)
+        return {
+            "max_candidate_area": float(max_candidate_area),
+            "rejected_small_area_count": int(rejected_small_area_count),
+            "color_candidates_filtered": filtered,
+        }
 
     def annotate_color_with_yolo_support(self, color_detections, yolo_detections):
         for det in color_detections:
@@ -539,37 +589,39 @@ class TargetLocalizerNode(Node):
     def select_fusion_detection(self, color_detections, yolo_detections, image_width, image_height, now=None):
         if now is None:
             now = time.time()
+        color_summary = self.summarize_color_candidates(color_detections)
+        filtered_color = color_summary["color_candidates_filtered"]
         if self.detector_mode == "color":
-            selected, reason = self.select_detection(color_detections, image_width, image_height, now=now)
-            return selected, reason, "color"
+            selected, reason = self.select_detection(filtered_color, image_width, image_height, now=now)
+            return selected, reason, "color", color_summary
 
         if self.detector_mode == "yolo":
             selected, reason = self.select_detection(yolo_detections, image_width, image_height, now=now)
-            return selected, reason, "yolo"
+            return selected, reason, "yolo", color_summary
 
-        self.annotate_color_with_yolo_support(color_detections, yolo_detections)
+        self.annotate_color_with_yolo_support(filtered_color, yolo_detections)
 
-        preferred_color = [det for det in color_detections if not det.debug_info.get("fusion_small_local", False)]
+        preferred_color = [det for det in filtered_color if not det.debug_info.get("fusion_small_local", False)]
         if preferred_color:
             selected, reason = self.select_detection(preferred_color, image_width, image_height, now=now)
             if selected is not None:
-                return selected, "fusion_color_primary" if reason == "new_target" else reason, "color"
+                return selected, "fusion_color_primary" if reason == "new_target" else reason, "color", color_summary
 
-        if color_detections:
-            selected, reason = self.select_detection(color_detections, image_width, image_height, now=now)
+        if filtered_color:
+            selected, reason = self.select_detection(filtered_color, image_width, image_height, now=now)
             if selected is not None and not selected.debug_info.get("fusion_small_local", False):
-                return selected, "fusion_color_only" if reason == "new_target" else reason, "color"
+                return selected, "fusion_color_only" if reason == "new_target" else reason, "color", color_summary
 
         if yolo_detections:
             selected, reason = self.select_detection(yolo_detections, image_width, image_height, now=now)
-            if selected is not None and color_detections:
-                return selected, "fusion_yolo_color_confirm" if reason == "new_target" else reason, "yolo_assisted"
-        if color_detections:
-            selected, reason = self.select_detection(color_detections, image_width, image_height, now=now)
-            return selected, "fusion_color_local_only" if selected is not None else reason, "color_local"
+            if selected is not None and filtered_color:
+                return selected, "fusion_yolo_color_confirm" if reason == "new_target" else reason, "yolo_assisted", color_summary
+        if filtered_color:
+            selected, reason = self.select_detection(filtered_color, image_width, image_height, now=now)
+            return selected, "fusion_color_local_only" if selected is not None else reason, "color_local", color_summary
 
         # fusion 模式下没有颜色确认时不盲信 YOLO，避免现场光照波动时误抓。
-        return None, "fusion_no_color_confirmation", "none"
+        return None, "fusion_no_color_confirmation", "none", color_summary
 
     def filter_base(self, base):
         current = {key: float(base[key]) for key in ("x", "y", "z")}
@@ -616,6 +668,7 @@ class TargetLocalizerNode(Node):
             "hold_frames": 0,
             "hold_age_s": 0.0,
             "stable_frames": 0,
+            "color_stable": False,
             "reason": reason,
             "select_reason": select_reason,
             "detector_mode": self.detector_mode,
@@ -632,6 +685,12 @@ class TargetLocalizerNode(Node):
             "detections_count": 0,
             "color_candidates_count": 0,
             "yolo_candidates_count": 0,
+            "max_candidate_area": 0.0,
+            "rejected_small_area_count": 0,
+            "locked_area": None,
+            "visibility_score": 0.0,
+            "depth_valid": False,
+            "valid_depth_count": 0,
             "image_width": int(image_width),
             "image_height": int(image_height),
             "arm_state_age_s": None,
@@ -673,7 +732,7 @@ class TargetLocalizerNode(Node):
             self.latest_yolo_time = now
         infer_done = time.time()
 
-        selected, select_reason, source = self.select_fusion_detection(
+        selected, select_reason, source, color_summary = self.select_fusion_detection(
             color_detections, yolo_detections, image_width, image_height, now=now
         )
 
@@ -684,6 +743,9 @@ class TargetLocalizerNode(Node):
                 "detections_count": len(color_detections) + len(yolo_detections),
                 "color_candidates_count": len(color_detections),
                 "yolo_candidates_count": len(yolo_detections),
+                "max_candidate_area": float(color_summary.get("max_candidate_area", 0.0)),
+                "rejected_small_area_count": int(color_summary.get("rejected_small_area_count", 0)),
+                "locked_area": float(self.locked_area) if self.locked_area is not None else None,
             }
         )
         if self.latest_arm_state is not None:
@@ -749,6 +811,7 @@ class TargetLocalizerNode(Node):
                     {
                         "valid": True,
                         "stable": bool(stable),
+                        "color_stable": bool(stable),
                         "stable_frames": int(stable_frames),
                         "reason": "ok",
                         "target_id": 0,
@@ -769,6 +832,10 @@ class TargetLocalizerNode(Node):
                         "base_mm": output_base,
                     }
                 )
+                msg_dict["visibility_score"] = float(selected.debug_info.get("visibility_score", 0.0))
+                msg_dict["depth_valid"] = bool(selected.valid_depth)
+                msg_dict["valid_depth_count"] = int(selected.debug_info.get("valid_depth_count", 0))
+                self.locked_area = float(selected.debug_info.get("area", self.bbox_area(selected)))
                 self.update_last_valid_target(selected, msg_dict, now)
 
         publish_dict = msg_dict
@@ -877,6 +944,7 @@ class TargetLocalizerNode(Node):
             f"locked_pixel: {locked_pixel_text}",
             f"selected_source: {msg_dict.get('source')}",
             f"detector_mode: {self.detector_mode}",
+            f"color_stable: {msg_dict.get('color_stable', False)}",
         ]
         for idx, line in enumerate(debug_lines):
             cv2.putText(
@@ -915,6 +983,8 @@ class TargetLocalizerNode(Node):
             )
             if det.debug_info.get("fusion_small_local", False):
                 label += " local"
+            if det.debug_info.get("rejected_small_area", False):
+                label += " small"
             cv2.putText(
                 display,
                 label,
@@ -961,6 +1031,12 @@ class TargetLocalizerNode(Node):
                 dbg = getattr(selected, "debug_info", {})
                 selected_lines = [
                     f"selected_area: {float(dbg.get('area', self.bbox_area(selected))):.0f}",
+                    f"max_candidate_area: {float(msg_dict.get('max_candidate_area', 0.0)):.0f}",
+                    f"visibility_score: {float(msg_dict.get('visibility_score', 0.0)):.2f}",
+                    f"depth_valid: {msg_dict.get('depth_valid', False)}",
+                    f"valid_depth_count: {int(msg_dict.get('valid_depth_count', 0))}",
+                    f"rejected_small_area_count: {int(msg_dict.get('rejected_small_area_count', 0))}",
+                    f"locked_area: {float(msg_dict.get('locked_area', 0.0) or 0.0):.0f}",
                     f"selected_score: {float(getattr(selected, 'score', getattr(selected, 'conf', 0.0))):.2f}",
                     f"selected_depth: {float(msg_dict.get('depth_mm', 0.0)):.1f}",
                     f"depth_source: {dbg.get('depth_source', 'window')}",
