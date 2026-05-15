@@ -12,6 +12,7 @@ def generate_launch_description():
     handeye_path = LaunchConfiguration("handeye_path")
     arm_port = LaunchConfiguration("arm_port")
     show_window = LaunchConfiguration("show_window")
+    enable_fill_light = LaunchConfiguration("enable_fill_light")
     detector_mode = LaunchConfiguration("detector_mode")
     yolo_every_n_frames = LaunchConfiguration("yolo_every_n_frames")
     color_calib_path = LaunchConfiguration("color_calib_path")
@@ -31,6 +32,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("arm_port", default_value="/dev/ttyUSB0"),
             DeclareLaunchArgument("show_window", default_value="false"),
+            DeclareLaunchArgument("enable_fill_light", default_value="false"),
             DeclareLaunchArgument("detector_mode", default_value="fusion"),
             DeclareLaunchArgument("yolo_every_n_frames", default_value="5"),
             DeclareLaunchArgument(
@@ -50,6 +52,7 @@ def generate_launch_description():
                         "port": arm_port,
                         "state_period": 0.2,
                         "auto_connect": True,
+                        "enable_fill_light": enable_fill_light,
                     }
                 ],
             ),

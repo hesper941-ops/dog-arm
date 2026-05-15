@@ -11,6 +11,7 @@ def generate_launch_description():
     handeye_path = LaunchConfiguration("handeye_path")
     arm_port = LaunchConfiguration("arm_port")
     show_window = LaunchConfiguration("show_window")
+    enable_fill_light = LaunchConfiguration("enable_fill_light")
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -29,6 +30,10 @@ def generate_launch_description():
             "show_window",
             default_value="true",
         ),
+        DeclareLaunchArgument(
+            "enable_fill_light",
+            default_value="false",
+        ),
 
         Node(
             package="red_block_grasp_ros2",
@@ -40,6 +45,7 @@ def generate_launch_description():
                     "port": arm_port,
                     "state_period": 0.2,
                     "auto_connect": True,
+                    "enable_fill_light": enable_fill_light,
                 }
             ],
         ),

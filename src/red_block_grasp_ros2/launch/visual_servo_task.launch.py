@@ -12,6 +12,7 @@ def generate_launch_description():
     handeye_path = LaunchConfiguration("handeye_path")
     arm_port = LaunchConfiguration("arm_port")
     show_window = LaunchConfiguration("show_window")
+    enable_fill_light = LaunchConfiguration("enable_fill_light")
     enable_pick_place_sequence = LaunchConfiguration("enable_pick_place_sequence")
     servo_min_z_mm = LaunchConfiguration("servo_min_z_mm")
     enable_execution_logger = LaunchConfiguration("enable_execution_logger")
@@ -35,6 +36,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "show_window",
+            default_value="false",
+        ),
+        DeclareLaunchArgument(
+            "enable_fill_light",
             default_value="false",
         ),
         DeclareLaunchArgument(
@@ -76,6 +81,7 @@ def generate_launch_description():
                     "port": arm_port,
                     "state_period": 0.2,
                     "auto_connect": True,
+                    "enable_fill_light": enable_fill_light,
                 }
             ],
         ),

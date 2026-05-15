@@ -75,10 +75,14 @@ class RoArmDriverNode(Node):
         self.declare_parameter("port", "/dev/ttyUSB0")
         self.declare_parameter("state_period", 0.2)
         self.declare_parameter("auto_connect", True)
+        self.declare_parameter("enable_fill_light", False)
+        self.declare_parameter("fill_light_led", 120)
 
         self.port = self.get_parameter("port").value
         self.state_period = float(self.get_parameter("state_period").value)
         self.auto_connect = bool(self.get_parameter("auto_connect").value)
+        self.enable_fill_light = self.parse_bool(self.get_parameter("enable_fill_light").value)
+        self.fill_light_led = max(0, min(255, int(self.get_parameter("fill_light_led").value)))
 
         self.pub_state = self.create_publisher(String, "/roarm_m3/state", 10)
         self.sub_cmd = self.create_subscription(String, "/roarm_m3/cmd", self.on_cmd, 10)
@@ -95,15 +99,38 @@ class RoArmDriverNode(Node):
         self.get_logger().info("RoArm driver node started.")
         self.get_logger().info(f"port = {self.port}")
         self.get_logger().info(f"state_period = {self.state_period}")
+        self.get_logger().info(
+            f"enable_fill_light = {self.enable_fill_light}, fill_light_led = {self.fill_light_led}"
+        )
+
+    @staticmethod
+    def parse_bool(value):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
 
     def connect_arm(self):
         try:
             self.arm.connect()
             self.connected = True
             self.get_logger().info("RoArm-M3 connected.")
+            self.apply_fill_light_default()
         except Exception as e:
             self.connected = False
             self.get_logger().error(f"Failed to connect RoArm-M3: {e}")
+
+    def apply_fill_light_default(self):
+        led = self.fill_light_led if self.enable_fill_light else 0
+        raw = {
+            "T": 114,
+            "led": led,
+        }
+        self.get_logger().info(
+            f"Applying fill light default after connect: {'on' if self.enable_fill_light else 'off'} (led={led})"
+        )
+        self.arm.send_cmd(raw)
 
     def publish_state(self):
         msg_dict = {
