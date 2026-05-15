@@ -52,6 +52,11 @@ class TargetLocalizerNode(Node):
         self.declare_parameter("target_lock_timeout_s", 1.0)
         self.declare_parameter("fusion_min_color_to_yolo_area_ratio", 0.45)
         self.declare_parameter("fusion_edge_margin_ratio", 0.18)
+        self.declare_parameter("enable_target_hold", True)
+        self.declare_parameter("target_hold_max_frames", 5)
+        self.declare_parameter("target_hold_timeout_s", 0.6)
+        self.declare_parameter("target_hold_max_pixel_drift", 80.0)
+        self.declare_parameter("target_hold_max_base_drift_mm", 80.0)
 
         self.declare_parameter("color_min_depth_mm", 100.0)
         self.declare_parameter("color_max_depth_mm", 700.0)
@@ -121,6 +126,11 @@ class TargetLocalizerNode(Node):
             self.get_parameter("fusion_min_color_to_yolo_area_ratio").value
         )
         self.fusion_edge_margin_ratio = float(self.get_parameter("fusion_edge_margin_ratio").value)
+        self.enable_target_hold = self.parse_bool(self.get_parameter("enable_target_hold").value)
+        self.target_hold_max_frames = max(0, int(self.get_parameter("target_hold_max_frames").value))
+        self.target_hold_timeout_s = float(self.get_parameter("target_hold_timeout_s").value)
+        self.target_hold_max_pixel_drift = float(self.get_parameter("target_hold_max_pixel_drift").value)
+        self.target_hold_max_base_drift_mm = float(self.get_parameter("target_hold_max_base_drift_mm").value)
 
         self.safe_roi_x_min_ratio = float(self.get_parameter("safe_roi_x_min_ratio").value)
         self.safe_roi_x_max_ratio = float(self.get_parameter("safe_roi_x_max_ratio").value)
@@ -156,6 +166,13 @@ class TargetLocalizerNode(Node):
         self.latest_yolo_time = 0.0
         self.last_hard_sample_time = 0.0
         self.last_force_sample_time = 0.0
+        self.last_valid_detection = None
+        self.last_valid_target_msg = None
+        self.last_valid_pixel = None
+        self.last_valid_base = None
+        self.last_valid_stamp = 0.0
+        self.lost_frame_count = 0
+        self.hold_active = False
 
         self.camera = OrbbecRgbdCamera()
         self.yolo_detector = None
@@ -393,12 +410,64 @@ class TargetLocalizerNode(Node):
         self.filtered_base = None
         self.stable_window.clear()
 
+    def clear_target_hold(self):
+        # 超时后彻底清空短时保持缓存，避免旧目标被长期复用。
+        self.last_valid_detection = None
+        self.last_valid_target_msg = None
+        self.last_valid_pixel = None
+        self.last_valid_base = None
+        self.last_valid_stamp = 0.0
+        self.lost_frame_count = 0
+        self.hold_active = False
+
     def target_lock_active(self, now):
         return (
             self.enable_target_lock
             and self.locked_pixel is not None
-            and (now - self.lock_last_seen_time) <= self.target_lock_timeout_s
+            and (now - self.lock_last_seen_time) <= max(self.target_lock_timeout_s, self.target_hold_timeout_s)
         )
+
+    @staticmethod
+    def base_distance(base_a, base_b):
+        if base_a is None or base_b is None:
+            return None
+        dx = float(base_a["x"]) - float(base_b["x"])
+        dy = float(base_a["y"]) - float(base_b["y"])
+        dz = float(base_a["z"]) - float(base_b["z"])
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    def update_last_valid_target(self, selected, msg_dict, now):
+        # 只有当前帧真正有效时才刷新缓存，短时保持不覆盖新鲜目标。
+        self.last_valid_detection = selected
+        self.last_valid_target_msg = json.loads(json.dumps(msg_dict))
+        self.last_valid_pixel = dict(msg_dict.get("pixel", {})) if msg_dict.get("pixel") else None
+        self.last_valid_base = dict(msg_dict.get("base_mm", {})) if msg_dict.get("base_mm") else None
+        self.last_valid_stamp = float(now)
+        self.lost_frame_count = 0
+        self.hold_active = False
+
+    def can_hold_target(self, now):
+        if not self.enable_target_hold or self.last_valid_target_msg is None or self.last_valid_stamp <= 0.0:
+            return False, None
+        hold_age = max(0.0, float(now) - float(self.last_valid_stamp))
+        if self.lost_frame_count > self.target_hold_max_frames:
+            return False, hold_age
+        if hold_age > self.target_hold_timeout_s:
+            return False, hold_age
+        return True, hold_age
+
+    def build_hold_message(self, now, reason):
+        can_hold, hold_age = self.can_hold_target(now)
+        if not can_hold:
+            return None
+        # 保持只用于短时抗抖，沿用上一帧已验证过的目标信息。
+        hold_msg = json.loads(json.dumps(self.last_valid_target_msg))
+        hold_msg["stamp"] = now
+        hold_msg["reason"] = reason
+        hold_msg["is_hold"] = True
+        hold_msg["hold_frames"] = int(self.lost_frame_count)
+        hold_msg["hold_age_s"] = float(hold_age)
+        return hold_msg
 
     def select_detection(self, detections, image_width, image_height, now=None):
         if now is None:
@@ -543,6 +612,9 @@ class TargetLocalizerNode(Node):
             "stamp": now,
             "valid": False,
             "stable": False,
+            "is_hold": False,
+            "hold_frames": 0,
+            "hold_age_s": 0.0,
             "stable_frames": 0,
             "reason": reason,
             "select_reason": select_reason,
@@ -617,19 +689,26 @@ class TargetLocalizerNode(Node):
         if self.latest_arm_state is not None:
             msg_dict["arm_state_age_s"] = now - self.latest_arm_state_time
 
+        hold_reason = None
         if selected is None:
             msg_dict["reason"] = select_reason
             self.stable_window.clear()
+            self.lost_frame_count += 1
+            hold_reason = select_reason
         elif self.latest_arm_state is None:
             self.locked_pixel = selected.center
             self.lock_last_seen_time = now
             msg_dict["reason"] = "no_arm_state"
             self.stable_window.clear()
+            self.lost_frame_count += 1
+            hold_reason = "no_arm_state"
         elif now - self.latest_arm_state_time > 1.0:
             self.locked_pixel = selected.center
             self.lock_last_seen_time = now
             msg_dict["reason"] = "arm_state_timeout"
             self.stable_window.clear()
+            self.lost_frame_count += 1
+            hold_reason = "arm_state_timeout"
         else:
             self.locked_pixel = selected.center
             self.lock_last_seen_time = now
@@ -637,7 +716,31 @@ class TargetLocalizerNode(Node):
             if location is None:
                 msg_dict["reason"] = "invalid_depth"
                 self.stable_window.clear()
+                self.lost_frame_count += 1
+                hold_reason = "invalid_depth"
             else:
+                if self.hold_active and self.last_valid_pixel is not None:
+                    pixel_jump = self.pixel_distance(
+                        selected.center,
+                        (self.last_valid_pixel["x"], self.last_valid_pixel["y"]),
+                    )
+                    if pixel_jump > self.target_hold_max_pixel_drift:
+                        msg_dict["reason"] = "hold_reject_far_pixel"
+                        self.stable_window.clear()
+                        self.lost_frame_count += 1
+                        hold_reason = "hold_reject_far_pixel"
+                        location = None
+
+                if location is not None and self.hold_active and self.last_valid_base is not None:
+                    base_jump = self.base_distance(location["base_mm"], self.last_valid_base)
+                    if base_jump is not None and base_jump > self.target_hold_max_base_drift_mm:
+                        msg_dict["reason"] = "hold_reject_far_base"
+                        self.stable_window.clear()
+                        self.lost_frame_count += 1
+                        hold_reason = "hold_reject_far_base"
+                        location = None
+
+            if location is not None:
                 raw_base = location["base_mm"]
                 filtered_base = self.filter_base(raw_base)
                 stable, stable_frames, stable_base = self.update_stability(filtered_base, location["depth_mm"])
@@ -666,15 +769,33 @@ class TargetLocalizerNode(Node):
                         "base_mm": output_base,
                     }
                 )
+                self.update_last_valid_target(selected, msg_dict, now)
 
-        if not self.publish_only_stable or msg_dict.get("stable", False) or not msg_dict.get("valid", False):
-            self.publish_json(msg_dict)
+        publish_dict = msg_dict
+        active_selected = selected
+        if not msg_dict.get("valid", False):
+            hold_msg = self.build_hold_message(now, hold_reason or msg_dict.get("reason", "no_detection"))
+            if hold_msg is not None:
+                publish_dict = hold_msg
+                active_selected = self.last_valid_detection
+                self.hold_active = True
+            else:
+                self.hold_active = False
+                can_hold, _ = self.can_hold_target(now)
+                if not can_hold:
+                    self.clear_target_hold()
+                    self.clear_target_lock()
+        else:
+            self.hold_active = False
+
+        if not self.publish_only_stable or publish_dict.get("stable", False) or not publish_dict.get("valid", False):
+            self.publish_json(publish_dict)
         publish_done = time.time()
 
-        self.maybe_save_samples(bgr, selected, msg_dict)
+        self.maybe_save_samples(bgr, active_selected, publish_dict)
         display_done = publish_done
         if self.show_window:
-            display = self.draw_debug(bgr, color_detections, yolo_detections, selected, msg_dict)
+            display = self.draw_debug(bgr, color_detections, yolo_detections, active_selected, publish_dict)
             if 0.05 < self.display_scale < 1.0:
                 display = cv2.resize(display, None, fx=self.display_scale, fy=self.display_scale, interpolation=cv2.INTER_AREA)
             cv2.imshow(self.window_name, display)
@@ -748,6 +869,10 @@ class TargetLocalizerNode(Node):
         locked_pixel_text = "none" if self.locked_pixel is None else f"({self.locked_pixel[0]},{self.locked_pixel[1]})"
         debug_lines = [
             f"LOCKED: {'yes' if lock_active else 'no'}",
+            f"HOLD: {'yes' if msg_dict.get('is_hold', False) else 'no'}",
+            f"lost_frames: {self.lost_frame_count}",
+            f"hold_age: {float(msg_dict.get('hold_age_s', 0.0)):.2f}s",
+            f"hold_timeout: {self.target_hold_timeout_s:.2f}s",
             f"lock_age: {lock_age:.2f}s",
             f"locked_pixel: {locked_pixel_text}",
             f"selected_source: {msg_dict.get('source')}",
@@ -805,7 +930,7 @@ class TargetLocalizerNode(Node):
             cv2.circle(display, selected.center, 5, (0, 255, 255), -1)
             cv2.putText(
                 display,
-                "SELECTED",
+                "HOLD TARGET" if msg_dict.get("is_hold", False) else "SELECTED",
                 (selected.x1, max(18, selected.y1 - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.50,
@@ -815,7 +940,7 @@ class TargetLocalizerNode(Node):
         elif selected is not None:
             cv2.putText(
                 display,
-                "SELECTED",
+                "HOLD TARGET" if msg_dict.get("is_hold", False) else "SELECTED",
                 (selected.x1, max(18, selected.y1 - 24)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.50,
@@ -829,6 +954,8 @@ class TargetLocalizerNode(Node):
                 f"{msg_dict.get('source')} stable={msg_dict.get('stable')} "
                 f"base=({base['x']:.1f},{base['y']:.1f},{base['z']:.1f})"
             )
+            if msg_dict.get("is_hold", False):
+                text += " HOLD TARGET"
             cv2.putText(display, text, (20, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 255, 255), 2)
             if selected is not None:
                 dbg = getattr(selected, "debug_info", {})

@@ -29,6 +29,11 @@ def generate_launch_description():
     color_aspect_max = LaunchConfiguration("color_aspect_max")
     color_extent_min = LaunchConfiguration("color_extent_min")
     color_solidity_min = LaunchConfiguration("color_solidity_min")
+    enable_target_hold = LaunchConfiguration("enable_target_hold")
+    target_hold_max_frames = LaunchConfiguration("target_hold_max_frames")
+    target_hold_timeout_s = LaunchConfiguration("target_hold_timeout_s")
+    target_hold_max_pixel_drift = LaunchConfiguration("target_hold_max_pixel_drift")
+    target_hold_max_base_drift_mm = LaunchConfiguration("target_hold_max_base_drift_mm")
 
     return LaunchDescription(
         [
@@ -62,6 +67,11 @@ def generate_launch_description():
             DeclareLaunchArgument("color_aspect_max", default_value="3.0"),
             DeclareLaunchArgument("color_extent_min", default_value="0.25"),
             DeclareLaunchArgument("color_solidity_min", default_value="0.50"),
+            DeclareLaunchArgument("enable_target_hold", default_value="true"),
+            DeclareLaunchArgument("target_hold_max_frames", default_value="5"),
+            DeclareLaunchArgument("target_hold_timeout_s", default_value="0.6"),
+            DeclareLaunchArgument("target_hold_max_pixel_drift", default_value="80.0"),
+            DeclareLaunchArgument("target_hold_max_base_drift_mm", default_value="80.0"),
             Node(
                 package="red_block_grasp_ros2",
                 executable="roarm_driver_node",
@@ -118,6 +128,11 @@ def generate_launch_description():
                         "safe_roi_y_max_ratio": 0.88,
                         "enable_target_lock": enable_target_lock,
                         "lock_max_pixel_jump": lock_max_pixel_jump,
+                        "enable_target_hold": enable_target_hold,
+                        "target_hold_max_frames": target_hold_max_frames,
+                        "target_hold_timeout_s": target_hold_timeout_s,
+                        "target_hold_max_pixel_drift": target_hold_max_pixel_drift,
+                        "target_hold_max_base_drift_mm": target_hold_max_base_drift_mm,
                         "center_weight": 0.25,
                         "base_filter_alpha": 0.55,
                     }
