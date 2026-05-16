@@ -3,11 +3,14 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from collections import deque
 
 import rclpy
 import yaml
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32, String
@@ -39,6 +42,10 @@ class VisualMoveItGraspNode(Node):
         super().__init__("visual_moveit_grasp")
         self.config_path = config_path
         self.cfg = load_yaml(config_path)
+        self.callback_group = ReentrantCallbackGroup()
+        self.timer_period_s = self.float_cfg("timer_period_s", 0.1)
+        self.move_line_timeout_s = self.float_cfg("move_line_timeout_s", 120.0)
+        self.service_wait_timeout_s = self.float_cfg("service_wait_timeout_s", 5.0)
 
         self.target_buffer = deque(maxlen=max(3, int(self.cfg["stable_target_min_frames"])))
         self.latest_target = None
@@ -56,7 +63,13 @@ class VisualMoveItGraspNode(Node):
             "LIFT",
         }
 
-        self.sub_target = self.create_subscription(String, "/red_block/target_base", self.on_target_msg, 10)
+        self.sub_target = self.create_subscription(
+            String,
+            "/red_block/target_base",
+            self.on_target_msg,
+            10,
+            callback_group=self.callback_group,
+        )
         self.pub_gripper = self.create_publisher(Float32, "/gripper_cmd", 10)
         self.pub_base_adjust = self.create_publisher(String, self.cfg["base_adjust_topic"], 10)
         self.pub_joint = None
@@ -66,13 +79,19 @@ class VisualMoveItGraspNode(Node):
                 str(self.cfg.get("official_joint_topic", "/joint_states")).strip() or "/joint_states",
                 10,
             )
-        self.move_line_client = self.create_client(MoveLineCmd, "/move_line_cmd")
-        self.timer = self.create_timer(0.1, self.on_timer)
+        self.move_line_client = self.create_client(
+            MoveLineCmd,
+            "/move_line_cmd",
+            callback_group=self.callback_group,
+        )
+        self.timer = self.create_timer(
+            self.timer_period_s,
+            self.on_timer,
+            callback_group=self.callback_group,
+        )
 
         self.get_logger().info(f"加载抓取配置: {self.config_path}")
-        self.get_logger().info(
-            "桥接启动: 订阅 /red_block/target_base, 调用 /move_line_cmd, 发布 /gripper_cmd"
-        )
+        self.get_logger().info("桥接启动: 订阅 /red_block/target_base, 调用 /move_line_cmd, 发布 /gripper_cmd")
 
     def bool_cfg(self, key):
         value = self.cfg.get(key, False)
@@ -98,12 +117,18 @@ class VisualMoveItGraspNode(Node):
             if reason:
                 text += f" | {reason}"
             self.get_logger().info(text)
+
+        if new_state == "RECOVER":
+            self.clear_snapshot()
+        elif new_state == "DONE":
+            self.clear_snapshot(reset_done_logged=False)
+            self.done_logged = False
+
         self.state = new_state
         self.state_enter_time = time.time()
         self.state_action_done = False
 
     def on_target_msg(self, msg):
-        # 当前 /red_block/target_base 为 std_msgs/String，内容是 JSON。
         try:
             data = json.loads(msg.data)
         except Exception as exc:
@@ -126,7 +151,6 @@ class VisualMoveItGraspNode(Node):
         if not bool(data.get("valid", False)):
             return None
         if bool(data.get("is_hold", False)):
-            # 只用实时视觉结果建 snapshot，不用上游 hold 结果盲抓。
             return None
 
         base = data.get("base_mm")
@@ -194,10 +218,7 @@ class VisualMoveItGraspNode(Node):
         elif y_mm < float(self.cfg["workspace_y_min_mm"]):
             request["suggested_action"] = "turn_right"
             request["turn_deg"] = 10.0
-        elif (
-            z_mm > float(self.cfg["workspace_z_max_mm"])
-            or z_mm < float(self.cfg["workspace_z_min_mm"])
-        ):
+        elif z_mm > float(self.cfg["workspace_z_max_mm"]) or z_mm < float(self.cfg["workspace_z_min_mm"]):
             request["suggested_action"] = "stop_and_reobserve"
 
         return request
@@ -261,14 +282,14 @@ class VisualMoveItGraspNode(Node):
         )
         return snapshot
 
-    def snapshot_expired(self):
+    def snapshot_expired(self, log_warning=True):
         if self.current_snapshot is None:
             return True
         age_frozen = time.time() - float(self.current_snapshot["frozen_at"])
         age_target = time.time() - float(self.current_snapshot["stamp"])
         limit = float(self.cfg["stage_target_max_age_s"])
         expired = age_frozen > limit or age_target > limit
-        if expired:
+        if expired and log_warning:
             self.get_logger().warn(
                 f"snapshot 过期: frozen_age={age_frozen:.2f}s target_age={age_target:.2f}s limit={limit:.2f}s"
             )
@@ -279,22 +300,25 @@ class VisualMoveItGraspNode(Node):
             return False
         if not self.bool_cfg("allow_snapshot_expire_during_motion"):
             return False
-        self.get_logger().warn(
-            "snapshot expired by age but allowed during current motion stage"
-        )
+        self.get_logger().warn("snapshot expired by age but allowed during current motion stage")
         return True
 
-    def clear_snapshot(self):
+    def clear_snapshot(self, reset_done_logged=True):
         self.current_snapshot = None
         self.target_buffer.clear()
-        self.done_logged = False
+        if reset_done_logged:
+            self.done_logged = False
+
+    def wait_for_future(self, future, timeout_sec):
+        done_event = threading.Event()
+        future.add_done_callback(lambda _: done_event.set())
+        return done_event.wait(timeout_sec)
 
     @staticmethod
     def deg_to_rad(value_deg):
         return float(value_deg) * math.pi / 180.0
 
     def build_observe_joint_message(self):
-        # 官方 driver 会按关节名查找 JointState，因此这里必须同时提供 name 和 position。
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
         joint_names = self.list_cfg("official_joint_names")
@@ -325,10 +349,10 @@ class VisualMoveItGraspNode(Node):
 
     def move_to_observe_joint_pose(self):
         if str(self.cfg.get("joint_command_mode", "official_joint_topic")).strip() != "official_joint_topic":
-            self.get_logger().error("未确认可靠的官方关节控制接口，不能自动回观察关节姿态")
+            self.get_logger().error("未确认可靠的官方关节控制接口，不能自动回观察关节姿态。")
             return False
         if self.pub_joint is None:
-            self.get_logger().error("官方关节控制 topic 未初始化，不能自动回观察关节姿态")
+            self.get_logger().error("官方关节控制 topic 未初始化，不能自动回观察关节姿态。")
             return False
 
         try:
@@ -336,6 +360,7 @@ class VisualMoveItGraspNode(Node):
         except Exception as exc:
             self.get_logger().error(f"构造观察关节姿态消息失败: {exc}")
             return False
+
         topic_name = str(self.cfg.get("official_joint_topic", "/joint_states")).strip() or "/joint_states"
         unit_mode = str(self.cfg.get("official_joint_units", "rad")).strip().lower()
         self.get_logger().info(
@@ -343,7 +368,7 @@ class VisualMoveItGraspNode(Node):
             f"topic={topic_name}, unit={unit_mode}, names={list(msg.name)}, position={list(msg.position)}"
         )
         if self.bool_cfg("dry_run"):
-            self.get_logger().info("MOVE_TO_OBSERVE_JOINT_POSE: dry_run=true，仅打印，不发布关节角")
+            self.get_logger().info("MOVE_TO_OBSERVE_JOINT_POSE: dry_run=true，仅打印，不发布关节姿态")
             return True
 
         try:
@@ -388,7 +413,7 @@ class VisualMoveItGraspNode(Node):
             self.get_logger().info(f"{stage_name}: dry_run=true，仅打印，不调用 /move_line_cmd")
             return True
 
-        if not self.move_line_client.wait_for_service(timeout_sec=2.0):
+        if not self.move_line_client.wait_for_service(timeout_sec=self.service_wait_timeout_s):
             self.get_logger().error("/move_line_cmd 服务不可用")
             return False
 
@@ -397,8 +422,7 @@ class VisualMoveItGraspNode(Node):
         req.y = float(y_m)
         req.z = float(z_m)
         future = self.move_line_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=60.0)
-        if not future.done():
+        if not self.wait_for_future(future, self.move_line_timeout_s):
             self.get_logger().error(f"{stage_name}: /move_line_cmd 调用超时")
             return False
 
@@ -437,21 +461,34 @@ class VisualMoveItGraspNode(Node):
                     self.set_state("WAIT_TARGET", "auto_start=true")
             return
 
+        if self.state == "DONE":
+            if not self.done_logged:
+                self.get_logger().info("抓取流程完成。当前第一版仅执行单个红块抓取。")
+                self.done_logged = True
+            return
+
+        if self.state == "RECOVER":
+            if not self.state_action_done:
+                self.get_logger().error("进入 RECOVER：本轮抓取终止，等待重新观测目标。")
+                self.clear_snapshot(reset_done_logged=False)
+                self.state_action_done = True
+            return
+
         if self.state == "MOVE_TO_OBSERVE_JOINT_POSE":
             if not self.state_action_done:
+                self.state_action_done = True
                 ok = self.move_to_observe_joint_pose()
                 if not ok:
                     self.set_state("RECOVER", "观察关节姿态发布失败")
                     return
-                self.state_action_done = True
             if now - self.state_enter_time >= self.float_cfg("observe_wait_s", 3.0):
                 self.set_state("WAIT_TARGET", "观察关节姿态等待完成")
             return
 
         if self.state == "WAIT_TARGET":
             if self.current_snapshot is not None:
-                if self.snapshot_expired():
-                    self.clear_snapshot()
+                if self.snapshot_expired(log_warning=False):
+                    self.clear_snapshot(reset_done_logged=False)
                 else:
                     self.set_state("OPEN_GRIPPER", "稳定目标已冻结")
                     return
@@ -466,7 +503,7 @@ class VisualMoveItGraspNode(Node):
             self.set_state("RECOVER", "抓取阶段缺少 snapshot")
             return
 
-        if self.snapshot_expired():
+        if self.state in self.motion_states and self.snapshot_expired():
             if not self.allow_expired_snapshot_in_current_state():
                 self.set_state("RECOVER", "snapshot 已过期")
                 return
@@ -496,11 +533,17 @@ class VisualMoveItGraspNode(Node):
             return
 
         if self.state == "MOVE_TO_PRE_GRASP":
+            if self.state_action_done:
+                return
+            self.state_action_done = True
             ok = self.move_line_mm("MOVE_TO_PRE_GRASP", pre_grasp_x, pre_grasp_y, pre_grasp_z)
             self.set_state("MOVE_LINE_TO_GRASP" if ok else "RECOVER", "预抓取位成功" if ok else "预抓取位失败")
             return
 
         if self.state == "MOVE_LINE_TO_GRASP":
+            if self.state_action_done:
+                return
+            self.state_action_done = True
             ok = self.move_line_mm("MOVE_LINE_TO_GRASP", grasp_x, grasp_y, grasp_z)
             self.set_state("CLOSE_GRIPPER" if ok else "RECOVER", "抓取位成功" if ok else "抓取位失败")
             return
@@ -514,24 +557,12 @@ class VisualMoveItGraspNode(Node):
             return
 
         if self.state == "LIFT":
+            if self.state_action_done:
+                return
+            self.state_action_done = True
             ok = self.move_line_mm("LIFT", lift_x, lift_y, lift_z)
             self.set_state("DONE" if ok else "RECOVER", "抬升成功" if ok else "抬升失败")
             return
-
-        if self.state == "DONE":
-            if not self.done_logged:
-                self.get_logger().info("抓取流程完成。当前第一版仅执行单个红块抓取。")
-                self.done_logged = True
-            self.clear_snapshot()
-            return
-
-        if self.state == "RECOVER":
-            if not self.state_action_done:
-                self.get_logger().error("进入 RECOVER：本轮抓取终止，等待重新观测目标。")
-                self.clear_snapshot()
-                self.state_action_done = True
-            if now - self.state_enter_time >= 1.0:
-                self.set_state("WAIT_TARGET", "recover 完成")
 
 
 def resolve_config_path():
@@ -551,11 +582,14 @@ def main(args=None):
 
     rclpy.init(args=args)
     node = VisualMoveItGraspNode(config_path)
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
