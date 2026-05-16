@@ -15,12 +15,14 @@ from red_block_grasp_ros2.core.camera_rgbd_orbbec import OrbbecRgbdCamera
 
 
 DEFAULT_OUTPUT = "/tmp/red_color_calib_competition.yaml"
+MODES = ("red_positive", "green_negative", "background_negative")
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="交互式标定红色/绿色/背景阈值。")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
-    parser.add_argument("--frames", type=int, default=120)
+    parser.add_argument("--frames", type=int, default=120, help="兼容旧参数，当前主要用于最低样本提示。")
+    parser.add_argument("--auto-sample-frames", type=int, default=60, help="按空格后自动采样的帧数，默认 60。")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--min-depth-mm", type=float, default=100.0)
     parser.add_argument("--max-depth-mm", type=float, default=700.0)
@@ -44,12 +46,15 @@ class RoiCollector:
 
     def on_mouse(self, event, x, y, flags, param):
         del flags, param
+
         if event == cv2.EVENT_LBUTTONDOWN:
             self.dragging = True
             self.start = (x, y)
             self.end = (x, y)
+
         elif event == cv2.EVENT_MOUSEMOVE and self.dragging:
             self.end = (x, y)
+
         elif event == cv2.EVENT_LBUTTONUP and self.dragging:
             self.dragging = False
             self.end = (x, y)
@@ -59,32 +64,43 @@ class RoiCollector:
     def normalized_rect(p1, p2):
         if p1 is None or p2 is None:
             return None
+
         x1 = min(p1[0], p2[0])
         y1 = min(p1[1], p2[1])
         x2 = max(p1[0], p2[0])
         y2 = max(p1[1], p2[1])
+
         if x2 - x1 < 6 or y2 - y1 < 6:
             return None
+
         return x1, y1, x2, y2
 
 
 def extract_pixels(bgr, rect):
     if rect is None:
         return None
+
     x1, y1, x2, y2 = rect
     roi = bgr[y1:y2, x1:x2]
+
     if roi.size == 0:
         return None
+
     blur = cv2.GaussianBlur(roi, (5, 5), 0)
+
     hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(blur, cv2.COLOR_BGR2LAB)
+
     b = blur[:, :, 0].reshape(-1).astype(np.float32)
     g = blur[:, :, 1].reshape(-1).astype(np.float32)
     r = blur[:, :, 2].reshape(-1).astype(np.float32)
+
     h = hsv[:, :, 0].reshape(-1).astype(np.float32)
     s = hsv[:, :, 1].reshape(-1).astype(np.float32)
     v = hsv[:, :, 2].reshape(-1).astype(np.float32)
+
     a = lab[:, :, 1].reshape(-1).astype(np.float32)
+
     return {
         "b": b,
         "g": g,
@@ -95,7 +111,7 @@ def extract_pixels(bgr, rect):
         "a": a,
         "rg": r - g,
         "rb": r - b,
-        "area": float((x2 - x1) * (y2 - y1)),
+        "area": np.asarray([float((x2 - x1) * (y2 - y1))], dtype=np.float32),
     }
 
 
@@ -106,10 +122,34 @@ def split_red_hue(h_values):
     return low, high
 
 
+def empty_sample_dict():
+    return {
+        key: np.asarray([], dtype=np.float32)
+        for key in ("b", "g", "r", "h", "s", "v", "a", "rg", "rb", "area")
+    }
+
+
+def merge_samples(sample_list):
+    if not sample_list:
+        return empty_sample_dict()
+
+    merged = {}
+    for key in sample_list[0]:
+        merged[key] = np.concatenate(
+            [item[key].reshape(-1) for item in sample_list],
+            axis=0,
+        ).astype(np.float32)
+
+    return merged
+
+
 def build_config(red_pos, green_neg, background_neg):
-    neg = green_neg + background_neg
+    neg = {}
+    for key in green_neg:
+        neg[key] = np.concatenate([green_neg[key], background_neg[key]], axis=0)
 
     red_h_low, red_h_high = split_red_hue(red_pos["h"])
+
     hsv_h1_min = clamp_int(percentile(red_h_low if red_h_low.size > 0 else [0], 5) - 3, 0, 20)
     hsv_h1_max = clamp_int(percentile(red_h_low if red_h_low.size > 0 else [12], 95) + 3, 0, 25)
     hsv_h2_min = clamp_int(percentile(red_h_high if red_h_high.size > 0 else [168], 5) - 3, 150, 180)
@@ -125,14 +165,19 @@ def build_config(red_pos, green_neg, background_neg):
 
     if neg["a"].size > 0:
         a_min_pos = max(a_min_pos, percentile(neg["a"], 95) + 4)
+
     if neg["rg"].size > 0:
         rg_min_pos = max(rg_min_pos, percentile(neg["rg"], 95) + 4)
+
     if neg["rb"].size > 0:
         rb_min_pos = max(rb_min_pos, percentile(neg["rb"], 95) + 4)
+
     if background_neg["s"].size > 0:
         s_min_pos = max(s_min_pos, percentile(background_neg["s"], 85))
+
     if background_neg["v"].size > 0:
         v_min_pos = max(v_min_pos, percentile(background_neg["v"], 15) - 5)
+
     if background_neg["r"].size > 0:
         r_min_pos = max(r_min_pos, percentile(background_neg["r"], 90))
 
@@ -167,43 +212,43 @@ def build_config(red_pos, green_neg, background_neg):
     }
 
 
-def merge_samples(sample_list):
-    if not sample_list:
-        return {key: np.asarray([], dtype=np.float32) for key in ("b", "g", "r", "h", "s", "v", "a", "rg", "rb", "area")}
-    merged = {}
-    for key in sample_list[0]:
-        merged[key] = np.concatenate([item[key].reshape(-1) for item in sample_list], axis=0).astype(np.float32)
-    return merged
-
-
 def write_yaml(path, config):
     import yaml
 
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     with output_path.open("w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False, allow_unicode=False)
 
 
-def draw_overlay(frame, collector, mode_name, counts, continuous_capture):
+def draw_overlay(frame, collector, mode_name, counts, auto_sampling, auto_done, auto_total):
     display = frame.copy()
+
     if collector.rect is not None:
         x1, y1, x2, y2 = collector.rect
         cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
     if collector.dragging and collector.start is not None and collector.end is not None:
         rect = collector.normalized_rect(collector.start, collector.end)
         if rect is not None:
             x1, y1, x2, y2 = rect
             cv2.rectangle(display, (x1, y1), (x2, y2), (255, 255, 0), 1)
 
+    if auto_sampling:
+        capture_text = f"auto sampling {mode_name}: {auto_done}/{auto_total}"
+    else:
+        capture_text = "idle"
+
     lines = [
         f"mode: {mode_name}",
-        f"capture: {'on' if continuous_capture else 'off'}",
+        f"capture: {capture_text}",
         f"red_positive: {counts['red_positive']}",
         f"green_negative: {counts['green_negative']}",
         f"background_negative: {counts['background_negative']}",
-        "keys: 1/2/3 switch mode, c capture once, space toggle capture, s save, q quit",
+        "keys: 1/2/3 switch, c capture once, SPACE auto sample, r clear current, s save, q quit",
     ]
+
     for idx, text in enumerate(lines):
         cv2.putText(
             display,
@@ -214,76 +259,155 @@ def draw_overlay(frame, collector, mode_name, counts, continuous_capture):
             (0, 255, 255),
             2,
         )
+
     return display
+
+
+def print_usage(auto_sample_frames):
+    print()
+    print("颜色阈值标定工具")
+    print("操作方式：")
+    print("  1：切换 red_positive，采红色物块，包括两个红块和不同颜色面")
+    print("  2：切换 green_negative，采绿色物块，作为负样本")
+    print("  3：切换 background_negative，采桌面、箱子、阴影、高光，作为负样本")
+    print("  鼠标左键拖框：选择采样 ROI")
+    print("  c：采当前 ROI 1 帧")
+    print(f"  空格：自动采当前类别 {auto_sample_frames} 帧")
+    print("  r：清空当前类别样本")
+    print("  s：保存 YAML")
+    print("  q / ESC：退出")
+    print()
 
 
 def main(argv=None):
     args = parse_args(argv)
+
     camera = OrbbecRgbdCamera()
     collector = RoiCollector()
+
     window_name = "red_green_threshold_calibration"
     mode = "red_positive"
-    continuous_capture = False
-    target_samples = max(12, int(args.frames))
+
     samples = {
         "red_positive": [],
         "green_negative": [],
         "background_negative": [],
     }
+
+    auto_sampling = False
+    auto_target = 0
+    auto_done = 0
+    auto_total = max(1, int(args.auto_sample_frames))
     last_capture_time = 0.0
+
+    print_usage(auto_total)
 
     try:
         camera.start()
+
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 1280, 720)
         cv2.setMouseCallback(window_name, collector.on_mouse)
 
         while True:
             bgr, depth_mm, _ = camera.read(timeout_ms=100)
-            if bgr is None or depth_mm is None:
+            del depth_mm
+
+            if bgr is None:
                 continue
 
             now = time.time()
-            if continuous_capture and collector.rect is not None and now - last_capture_time >= 0.06:
-                sample = extract_pixels(bgr, collector.rect)
-                if sample is not None:
-                    samples[mode].append(sample)
-                    last_capture_time = now
+
+            if auto_sampling and now - last_capture_time >= 0.04:
+                if collector.rect is None:
+                    print("no valid sample region, auto sampling skipped")
+                    auto_sampling = False
+                    auto_done = 0
+                    auto_target = 0
+                else:
+                    sample = extract_pixels(bgr, collector.rect)
+                    if sample is None:
+                        print("no valid sample region, auto sampling skipped")
+                        auto_sampling = False
+                        auto_done = 0
+                        auto_target = 0
+                    else:
+                        samples[mode].append(sample)
+                        auto_done += 1
+                        last_capture_time = now
+                        print(f"auto sampling {mode}: {auto_done}/{auto_target}", end="\r")
+
+                        if auto_done >= auto_target:
+                            auto_sampling = False
+                            print()
+                            print(f"auto sampling {mode} done, total samples: {len(samples[mode])}")
 
             counts = {key: len(value) for key, value in samples.items()}
-            display = draw_overlay(bgr, collector, mode, counts, continuous_capture)
-            if args.show or True:
-                cv2.imshow(window_name, display)
+            display = draw_overlay(
+                bgr,
+                collector,
+                mode,
+                counts,
+                auto_sampling,
+                auto_done,
+                auto_target if auto_target > 0 else auto_total,
+            )
 
+            cv2.imshow(window_name, display)
             key = cv2.waitKey(1) & 0xFF
+
             if key == ord("1"):
                 mode = "red_positive"
+                auto_sampling = False
+                print(f"mode -> {mode}")
+
             elif key == ord("2"):
                 mode = "green_negative"
+                auto_sampling = False
+                print(f"mode -> {mode}")
+
             elif key == ord("3"):
                 mode = "background_negative"
+                auto_sampling = False
+                print(f"mode -> {mode}")
+
             elif key == ord("c"):
                 sample = extract_pixels(bgr, collector.rect)
-                if sample is not None:
+                if sample is None:
+                    print("no valid sample region, capture once skipped")
+                else:
                     samples[mode].append(sample)
+                    print(f"capture once {mode}, total samples: {len(samples[mode])}")
+
             elif key == ord(" "):
-                continuous_capture = not continuous_capture
+                if collector.rect is None:
+                    print("no valid sample region, auto sampling skipped")
+                else:
+                    auto_sampling = True
+                    auto_done = 0
+                    auto_target = auto_total
+                    last_capture_time = 0.0
+                    print(f"start auto sampling {mode}: {auto_target} frames")
+
             elif key == ord("r"):
                 samples[mode].clear()
+                auto_sampling = False
+                print(f"clear samples: {mode}")
+
             elif key == ord("s"):
                 break
+
             elif key in (ord("q"), 27):
                 return 1
-
-            if len(samples["red_positive"]) >= target_samples and len(samples["green_negative"]) >= 8 and len(samples["background_negative"]) >= 8:
-                break
 
         if len(samples["red_positive"]) < 8:
             print("ERROR: red_positive 样本不足，至少需要 8 次采样。")
             return 1
+
         if len(samples["green_negative"]) < 4:
             print("ERROR: green_negative 样本不足，至少需要 4 次采样。")
             return 1
+
         if len(samples["background_negative"]) < 4:
             print("ERROR: background_negative 样本不足，至少需要 4 次采样。")
             return 1
@@ -291,9 +415,11 @@ def main(argv=None):
         red_pos = merge_samples(samples["red_positive"])
         green_neg = merge_samples(samples["green_negative"])
         background_neg = merge_samples(samples["background_negative"])
+
         config = build_config(red_pos, green_neg, background_neg)
         config["color_min_depth_mm"] = float(args.min_depth_mm)
         config["color_max_depth_mm"] = float(args.max_depth_mm)
+
         write_yaml(args.output, config)
 
         print(f"Saved calibration YAML: {args.output}")
@@ -302,14 +428,18 @@ def main(argv=None):
         print("- green_negative 请覆盖绿色物块正面与侧面。")
         print("- background_negative 请覆盖桌面、箱子、阴影和反光区域。")
         print("推荐参数：")
+
         for key, value in config.items():
             print(f"{key}: {value}")
+
         return 0
+
     finally:
         try:
             camera.stop()
         except Exception:
             pass
+
         try:
             cv2.destroyAllWindows()
         except Exception:

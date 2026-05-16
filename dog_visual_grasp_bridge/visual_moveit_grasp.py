@@ -397,7 +397,7 @@ class VisualMoveItGraspNode(Node):
         req.y = float(y_m)
         req.z = float(z_m)
         future = self.move_line_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=20.0)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=60.0)
         if not future.done():
             self.get_logger().error(f"{stage_name}: /move_line_cmd 调用超时")
             return False
