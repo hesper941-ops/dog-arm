@@ -50,6 +50,7 @@ class VisualMoveItGraspNode(Node):
         self.target_buffer = deque(maxlen=max(3, int(self.cfg["stable_target_min_frames"])))
         self.latest_target = None
         self.current_snapshot = None
+        self.current_grasp_targets = None
         self.state = "IDLE"
         self.state_enter_time = time.time()
         self.state_action_done = False
@@ -305,6 +306,7 @@ class VisualMoveItGraspNode(Node):
 
     def clear_snapshot(self, reset_done_logged=True):
         self.current_snapshot = None
+        self.current_grasp_targets = None
         self.target_buffer.clear()
         if reset_done_logged:
             self.done_logged = False
@@ -394,6 +396,78 @@ class VisualMoveItGraspNode(Node):
         y_m = float(self.cfg["moveit_y_sign"]) * float(y_mm) * scale + float(self.cfg["moveit_y_offset_m"])
         z_m = float(self.cfg["moveit_z_sign"]) * float(z_mm) * scale + float(self.cfg["moveit_z_offset_m"])
         return x_m, y_m, z_m
+
+    def build_grasp_targets_from_snapshot(self):
+        snapshot = self.current_snapshot
+        if snapshot is None:
+            return None
+
+        raw_x = float(snapshot["x_mm"])
+        raw_y = float(snapshot["y_mm"])
+        raw_z = float(snapshot["z_mm"])
+
+        if self.bool_cfg("enable_grasp_coordinate_compensation"):
+            bias_x = self.float_cfg("grasp_bias_x_mm", 0.0)
+            bias_y = self.float_cfg("grasp_bias_y_mm", 0.0)
+            bias_z = self.float_cfg("grasp_bias_z_mm", 0.0)
+        else:
+            bias_x = 0.0
+            bias_y = 0.0
+            bias_z = 0.0
+
+        pre_x = raw_x + bias_x if self.bool_cfg("apply_xy_bias_to_pre_grasp") else raw_x
+        pre_y = raw_y + bias_y if self.bool_cfg("apply_xy_bias_to_pre_grasp") else raw_y
+        pre_z = raw_z + self.float_cfg("pre_grasp_z_offset_mm", 0.0)
+        if self.bool_cfg("apply_z_bias_to_pre_grasp"):
+            pre_z += bias_z
+
+        grasp_x = raw_x + bias_x
+        grasp_y = raw_y + bias_y
+        grasp_z = raw_z + self.float_cfg("grasp_offset_z_mm", 0.0) + bias_z
+
+        lift_x = grasp_x
+        lift_y = grasp_y
+        lift_z = grasp_z + self.float_cfg("lift_up_mm", 0.0)
+
+        if self.bool_cfg("enable_fixed_grasp_rpy"):
+            grasp_rpy = {
+                "roll": self.float_cfg("fixed_grasp_roll_rad", 0.0),
+                "pitch": self.float_cfg("fixed_grasp_pitch_rad", 0.0),
+                "yaw": self.float_cfg("fixed_grasp_yaw_rad", 0.0),
+            }
+        else:
+            grasp_rpy = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+
+        self.get_logger().info(f"VISUAL_TARGET raw_mm=({raw_x:.1f},{raw_y:.1f},{raw_z:.1f})")
+        self.get_logger().info(
+            "GRASP_TARGET compensated_mm="
+            f"({grasp_x:.1f},{grasp_y:.1f},{grasp_z:.1f}), "
+            f"bias=({bias_x:.1f},{bias_y:.1f},{bias_z:.1f}), "
+            f"rpy=({grasp_rpy['roll']:.4f},{grasp_rpy['pitch']:.4f},{grasp_rpy['yaw']:.4f})"
+        )
+
+        return {
+            "raw": {"x_mm": raw_x, "y_mm": raw_y, "z_mm": raw_z},
+            "pre_grasp": {"x_mm": pre_x, "y_mm": pre_y, "z_mm": pre_z},
+            "grasp": {"x_mm": grasp_x, "y_mm": grasp_y, "z_mm": grasp_z},
+            "lift": {"x_mm": lift_x, "y_mm": lift_y, "z_mm": lift_z},
+            "bias": {"x_mm": bias_x, "y_mm": bias_y, "z_mm": bias_z},
+            "grasp_rpy": grasp_rpy,
+        }
+
+    def ensure_grasp_targets(self):
+        if self.current_snapshot is None:
+            return None
+        if self.current_grasp_targets is None:
+            self.current_grasp_targets = self.build_grasp_targets_from_snapshot()
+        return self.current_grasp_targets
+
+    def settle_after_motion(self, stage_name, duration_s):
+        settle_s = max(0.0, float(duration_s))
+        if settle_s <= 0.0:
+            return
+        self.get_logger().info(f"{stage_name}: settle {settle_s:.2f}s")
+        time.sleep(settle_s)
 
     def move_line_mm(self, stage_name, x_mm, y_mm, z_mm):
         if not self.workspace_contains(x_mm, y_mm, z_mm):
@@ -496,6 +570,7 @@ class VisualMoveItGraspNode(Node):
             snapshot = self.try_build_snapshot()
             if snapshot is not None:
                 self.current_snapshot = snapshot
+                self.current_grasp_targets = self.build_grasp_targets_from_snapshot()
                 self.set_state("OPEN_GRIPPER", "target_snapshot created")
             return
 
@@ -503,26 +578,15 @@ class VisualMoveItGraspNode(Node):
             self.set_state("RECOVER", "抓取阶段缺少 snapshot")
             return
 
+        grasp_targets = self.ensure_grasp_targets()
+        if grasp_targets is None:
+            self.set_state("RECOVER", "grasp targets unavailable")
+            return
+
         if self.state in self.motion_states and self.snapshot_expired():
             if not self.allow_expired_snapshot_in_current_state():
                 self.set_state("RECOVER", "snapshot 已过期")
                 return
-
-        target_x = float(self.current_snapshot["x_mm"])
-        target_y = float(self.current_snapshot["y_mm"])
-        target_z = float(self.current_snapshot["z_mm"])
-
-        pre_grasp_x = target_x + float(self.cfg["grasp_offset_x_mm"])
-        pre_grasp_y = target_y + float(self.cfg["grasp_offset_y_mm"])
-        pre_grasp_z = target_z + float(self.cfg["pre_grasp_z_offset_mm"])
-
-        grasp_x = target_x + float(self.cfg["grasp_offset_x_mm"])
-        grasp_y = target_y + float(self.cfg["grasp_offset_y_mm"])
-        grasp_z = target_z + float(self.cfg["grasp_offset_z_mm"])
-
-        lift_x = grasp_x
-        lift_y = grasp_y
-        lift_z = grasp_z + float(self.cfg["lift_up_mm"])
 
         if self.state == "OPEN_GRIPPER":
             if not self.state_action_done:
@@ -536,7 +600,21 @@ class VisualMoveItGraspNode(Node):
             if self.state_action_done:
                 return
             self.state_action_done = True
-            ok = self.move_line_mm("MOVE_TO_PRE_GRASP", pre_grasp_x, pre_grasp_y, pre_grasp_z)
+            pre_grasp = grasp_targets["pre_grasp"]
+            grasp_rpy = grasp_targets["grasp_rpy"]
+            self.get_logger().info(
+                "MOVE_TO_PRE_GRASP target: "
+                f"mm=({pre_grasp['x_mm']:.1f},{pre_grasp['y_mm']:.1f},{pre_grasp['z_mm']:.1f}) "
+                f"rpy=({grasp_rpy['roll']:.4f},{grasp_rpy['pitch']:.4f},{grasp_rpy['yaw']:.4f})"
+            )
+            ok = self.move_line_mm(
+                "MOVE_TO_PRE_GRASP",
+                pre_grasp["x_mm"],
+                pre_grasp["y_mm"],
+                pre_grasp["z_mm"],
+            )
+            if ok:
+                self.settle_after_motion("MOVE_TO_PRE_GRASP", self.float_cfg("pre_grasp_settle_s", 0.5))
             self.set_state("MOVE_LINE_TO_GRASP" if ok else "RECOVER", "预抓取位成功" if ok else "预抓取位失败")
             return
 
@@ -544,7 +622,21 @@ class VisualMoveItGraspNode(Node):
             if self.state_action_done:
                 return
             self.state_action_done = True
-            ok = self.move_line_mm("MOVE_LINE_TO_GRASP", grasp_x, grasp_y, grasp_z)
+            grasp = grasp_targets["grasp"]
+            grasp_rpy = grasp_targets["grasp_rpy"]
+            self.get_logger().info(
+                "MOVE_LINE_TO_GRASP target: "
+                f"mm=({grasp['x_mm']:.1f},{grasp['y_mm']:.1f},{grasp['z_mm']:.1f}) "
+                f"rpy=({grasp_rpy['roll']:.4f},{grasp_rpy['pitch']:.4f},{grasp_rpy['yaw']:.4f})"
+            )
+            ok = self.move_line_mm(
+                "MOVE_LINE_TO_GRASP",
+                grasp["x_mm"],
+                grasp["y_mm"],
+                grasp["z_mm"],
+            )
+            if ok:
+                self.settle_after_motion("MOVE_LINE_TO_GRASP", self.float_cfg("grasp_settle_s", 1.0))
             self.set_state("CLOSE_GRIPPER" if ok else "RECOVER", "抓取位成功" if ok else "抓取位失败")
             return
 
@@ -560,7 +652,16 @@ class VisualMoveItGraspNode(Node):
             if self.state_action_done:
                 return
             self.state_action_done = True
-            ok = self.move_line_mm("LIFT", lift_x, lift_y, lift_z)
+            lift = grasp_targets["lift"]
+            grasp_rpy = grasp_targets["grasp_rpy"]
+            self.get_logger().info(
+                "LIFT target: "
+                f"mm=({lift['x_mm']:.1f},{lift['y_mm']:.1f},{lift['z_mm']:.1f}) "
+                f"rpy=({grasp_rpy['roll']:.4f},{grasp_rpy['pitch']:.4f},{grasp_rpy['yaw']:.4f})"
+            )
+            ok = self.move_line_mm("LIFT", lift["x_mm"], lift["y_mm"], lift["z_mm"])
+            if ok:
+                self.settle_after_motion("LIFT", self.float_cfg("lift_settle_s", 0.5))
             self.set_state("DONE" if ok else "RECOVER", "抬升成功" if ok else "抬升失败")
             return
 

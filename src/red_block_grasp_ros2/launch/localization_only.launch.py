@@ -13,6 +13,7 @@ def generate_launch_description():
     arm_port = LaunchConfiguration("arm_port")
     start_roarm_driver = LaunchConfiguration("start_roarm_driver")
     show_window = LaunchConfiguration("show_window")
+    debug_overlay_level = LaunchConfiguration("debug_overlay_level")
     enable_fill_light = LaunchConfiguration("enable_fill_light")
     detector_mode = LaunchConfiguration("detector_mode")
     color_calib_path = LaunchConfiguration("color_calib_path")
@@ -62,6 +63,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "show_window",
             default_value="true",
+        ),
+        DeclareLaunchArgument(
+            "debug_overlay_level",
+            default_value="compact",
         ),
         DeclareLaunchArgument(
             "enable_fill_light",
@@ -137,6 +142,7 @@ def generate_launch_description():
                     "max_targets": 4,
                     "timer_period": target_timer_period,
                     "show_window": show_window,
+                    "debug_overlay_level": debug_overlay_level,
                     "detector_mode": detector_mode,
                     "color_calib_path": color_calib_path,
                     "enable_color_detector": True,

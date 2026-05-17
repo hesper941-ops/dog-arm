@@ -36,6 +36,7 @@ class TargetLocalizerNode(Node):
         self.declare_parameter("timer_period", 0.08)
         self.declare_parameter("show_window", True)
         self.declare_parameter("display_scale", 0.75)
+        self.declare_parameter("debug_overlay_level", "compact")
         self.declare_parameter("detector_device", "")
         self.declare_parameter("detector_half", False)
         self.declare_parameter("perf_log_interval_s", 3.0)
@@ -114,6 +115,9 @@ class TargetLocalizerNode(Node):
         self.timer_period = float(self.get_parameter("timer_period").value)
         self.show_window = self.parse_bool(self.get_parameter("show_window").value)
         self.display_scale = float(self.get_parameter("display_scale").value)
+        self.debug_overlay_level = str(self.get_parameter("debug_overlay_level").value).strip().lower()
+        if self.debug_overlay_level not in ("none", "compact", "full"):
+            self.debug_overlay_level = "compact"
         self.detector_device = str(self.get_parameter("detector_device").value)
         self.detector_half = self.parse_bool(self.get_parameter("detector_half").value)
         self.perf_log_interval_s = float(self.get_parameter("perf_log_interval_s").value)
@@ -1034,27 +1038,50 @@ class TargetLocalizerNode(Node):
             self.save_sample_image(bgr, selected, msg_dict, f"lowconf_{conf:.2f}")
             self.last_hard_sample_time = now
 
-    def draw_debug(self, image, color_detections, yolo_detections, selected, msg_dict):
-        display = image.copy()
-        image_height, image_width = image.shape[:2]
-        x_min = int(image_width * self.safe_roi_x_min_ratio)
-        x_max = int(image_width * self.safe_roi_x_max_ratio)
-        y_min = int(image_height * self.safe_roi_y_min_ratio)
-        y_max = int(image_height * self.safe_roi_y_max_ratio)
-        cv2.rectangle(display, (x_min, y_min), (x_max, y_max), (255, 255, 0), 2)
-        cv2.putText(
-            display,
-            f"Target Localizer | {self.detector_mode} | FPS={self.fps:.1f}",
-            (20, 35),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (0, 255, 255),
-            2,
-        )
+    def draw_overlay_lines(self, display, lines, start_y=35, color=(0, 255, 255)):
+        for idx, line in enumerate(lines):
+            cv2.putText(
+                display,
+                line,
+                (20, start_y + idx * 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                color,
+                2,
+            )
+
+    def compact_overlay_lines(self, msg_dict):
+        valid = bool(msg_dict.get("valid", False))
+        reason = str(msg_dict.get("reason", ""))
+        source = str(msg_dict.get("source", ""))
+        confidence = float(msg_dict.get("confidence", 0.0) or 0.0)
+        pixel = msg_dict.get("pixel") or {}
+        pixel_x = int(pixel.get("x", -1)) if isinstance(pixel, dict) else -1
+        pixel_y = int(pixel.get("y", -1)) if isinstance(pixel, dict) else -1
+        depth_mm = msg_dict.get("depth_mm", None)
+        depth_text = "n/a" if depth_mm is None else f"{float(depth_mm):.1f}mm"
+        base = msg_dict.get("base_mm") or {}
+        if isinstance(base, dict) and {"x", "y", "z"} <= set(base.keys()):
+            base_text = f"x={float(base['x']):.1f} y={float(base['y']):.1f} z={float(base['z']):.1f}"
+        else:
+            base_text = "n/a"
+        lock_text = "ON" if self.target_lock_active(time.time()) else "OFF"
+        hold_text = "ON" if msg_dict.get("is_hold", False) else "OFF"
+        return [
+            f"valid: {valid} reason: {reason}",
+            f"src: {source} conf: {confidence:.2f}",
+            f"pixel: ({pixel_x},{pixel_y}) depth: {depth_text}",
+            f"base_mm: {base_text}",
+            f"lock: {lock_text} hold: {hold_text}",
+            f"fps: {self.fps:.1f}",
+        ]
+
+    def full_overlay_lines(self, msg_dict):
         lock_active = self.target_lock_active(time.time())
         lock_age = 0.0 if self.locked_pixel is None else max(0.0, time.time() - self.lock_last_seen_time)
         locked_pixel_text = "none" if self.locked_pixel is None else f"({self.locked_pixel[0]},{self.locked_pixel[1]})"
-        debug_lines = [
+        return [
+            f"Target Localizer | {self.detector_mode} | FPS={self.fps:.1f}",
             f"LOCKED: {'yes' if lock_active else 'no'}",
             f"HOLD: {'yes' if msg_dict.get('is_hold', False) else 'no'}",
             f"lost_frames: {self.lost_frame_count}",
@@ -1068,68 +1095,75 @@ class TargetLocalizerNode(Node):
             f"official_pose_age_s: {float(msg_dict.get('official_pose_age_s', 0.0) or 0.0):.2f}",
             f"color_stable: {msg_dict.get('color_stable', False)}",
         ]
-        for idx, line in enumerate(debug_lines):
-            cv2.putText(
-                display,
-                line,
-                (20, 65 + idx * 24),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 255),
-                2,
-            )
 
-        for idx, det in enumerate(yolo_detections):
+    def draw_debug(self, image, color_detections, yolo_detections, selected, msg_dict):
+        display = image.copy()
+        image_height, image_width = image.shape[:2]
+        x_min = int(image_width * self.safe_roi_x_min_ratio)
+        x_max = int(image_width * self.safe_roi_x_max_ratio)
+        y_min = int(image_height * self.safe_roi_y_min_ratio)
+        y_max = int(image_height * self.safe_roi_y_max_ratio)
+        cv2.rectangle(display, (x_min, y_min), (x_max, y_max), (255, 255, 0), 2)
+
+        overlay_level = self.debug_overlay_level
+        show_text = overlay_level != "none"
+        full_overlay = overlay_level == "full"
+
+        for det in yolo_detections:
             cv2.rectangle(display, (det.x1, det.y1), (det.x2, det.y2), (255, 0, 0), 2)
-            label = f"YOLO conf={float(getattr(det, 'conf', 0.0)):.2f}"
-            cv2.putText(
-                display,
-                label,
-                (det.x1, max(18, det.y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (255, 0, 0),
-                2,
-            )
-        for idx, det in enumerate(color_detections):
+            if full_overlay:
+                label = f"YOLO conf={float(getattr(det, 'conf', 0.0)):.2f}"
+                cv2.putText(
+                    display,
+                    label,
+                    (det.x1, max(18, det.y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 0, 0),
+                    2,
+                )
+
+        for det in color_detections:
             is_selected = selected is det
             color = (0, 255, 255) if is_selected else (0, 0, 255)
             cv2.rectangle(display, (det.x1, det.y1), (det.x2, det.y2), color, 3 if is_selected else 2)
             cv2.circle(display, det.center, 5, color, -1)
-            det_area = float(det.debug_info.get("area", self.bbox_area(det)))
-            extent = float(det.debug_info.get("extent", 0.0))
-            solidity = float(det.debug_info.get("solidity", 0.0))
-            label = (
-                f"COLOR score={float(getattr(det, 'score', getattr(det, 'conf', 0.0))):.2f} "
-                f"area={det_area:.0f} extent={extent:.2f} solidity={solidity:.2f}"
-            )
-            if det.debug_info.get("fusion_small_local", False):
-                label += " local"
-            if det.debug_info.get("rejected_small_area", False):
-                label += " small"
-            cv2.putText(
-                display,
-                label,
-                (det.x1, min(image_height - 8, det.y2 + 16 if det.y1 < 24 else det.y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                color,
-                2,
-            )
+            if full_overlay:
+                det_area = float(det.debug_info.get("area", self.bbox_area(det)))
+                extent = float(det.debug_info.get("extent", 0.0))
+                solidity = float(det.debug_info.get("solidity", 0.0))
+                label = (
+                    f"COLOR score={float(getattr(det, 'score', getattr(det, 'conf', 0.0))):.2f} "
+                    f"area={det_area:.0f} extent={extent:.2f} solidity={solidity:.2f}"
+                )
+                if det.debug_info.get("fusion_small_local", False):
+                    label += " local"
+                if det.debug_info.get("rejected_small_area", False):
+                    label += " small"
+                cv2.putText(
+                    display,
+                    label,
+                    (det.x1, min(image_height - 8, det.y2 + 16 if det.y1 < 24 else det.y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    2,
+                )
 
         if selected is not None and all(selected is not det for det in color_detections):
             cv2.rectangle(display, (selected.x1, selected.y1), (selected.x2, selected.y2), (0, 255, 255), 3)
             cv2.circle(display, selected.center, 5, (0, 255, 255), -1)
-            cv2.putText(
-                display,
-                "HOLD TARGET" if msg_dict.get("is_hold", False) else "SELECTED",
-                (selected.x1, max(18, selected.y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.50,
-                (0, 255, 255),
-                2,
-            )
-        elif selected is not None:
+            if full_overlay:
+                cv2.putText(
+                    display,
+                    "HOLD TARGET" if msg_dict.get("is_hold", False) else "SELECTED",
+                    (selected.x1, max(18, selected.y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.50,
+                    (0, 255, 255),
+                    2,
+                )
+        elif selected is not None and full_overlay:
             cv2.putText(
                 display,
                 "HOLD TARGET" if msg_dict.get("is_hold", False) else "SELECTED",
@@ -1140,6 +1174,14 @@ class TargetLocalizerNode(Node):
                 2,
             )
 
+        if not show_text:
+            return display
+
+        if overlay_level == "compact":
+            self.draw_overlay_lines(display, self.compact_overlay_lines(msg_dict))
+            return display
+
+        self.draw_overlay_lines(display, self.full_overlay_lines(msg_dict))
         if msg_dict.get("valid", False):
             base = msg_dict["base_mm"]
             text = (
@@ -1169,16 +1211,7 @@ class TargetLocalizerNode(Node):
                     f"color_rg_delta: {float(dbg.get('mean_rg_delta', 0.0)):.1f}",
                     f"color_rb_delta: {float(dbg.get('mean_rb_delta', 0.0)):.1f}",
                 ]
-                for idx, line in enumerate(selected_lines):
-                    cv2.putText(
-                        display,
-                        line,
-                        (20, 220 + idx * 24),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (0, 255, 255),
-                        2,
-                    )
+                self.draw_overlay_lines(display, selected_lines, start_y=220)
         else:
             cv2.putText(
                 display,
