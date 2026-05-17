@@ -41,7 +41,11 @@ stable_target_max_position_std_mm: 30.0
 stage_target_max_age_s: 3.0
 allow_snapshot_expire_during_motion: true
 move_line_timeout_s: 120.0
+move_joint_timeout_s: 120.0
 service_wait_timeout_s: 5.0
+use_move_joint_for_pre_grasp: true
+use_move_joint_for_grasp: true
+use_move_joint_for_lift: true
 
 move_to_observe_joint_pose_on_start: false
 observe_b_deg: 0.0

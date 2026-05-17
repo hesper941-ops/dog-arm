@@ -15,7 +15,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32, String
 
-from roarm_msgs.srv import MoveLineCmd
+from roarm_msgs.srv import MoveJointCmd, MoveLineCmd
 
 
 def load_yaml(path):
@@ -45,6 +45,7 @@ class VisualMoveItGraspNode(Node):
         self.callback_group = ReentrantCallbackGroup()
         self.timer_period_s = self.float_cfg("timer_period_s", 0.1)
         self.move_line_timeout_s = self.float_cfg("move_line_timeout_s", 120.0)
+        self.move_joint_timeout_s = self.float_cfg("move_joint_timeout_s", 120.0)
         self.service_wait_timeout_s = self.float_cfg("service_wait_timeout_s", 5.0)
 
         self.target_buffer = deque(maxlen=max(3, int(self.cfg["stable_target_min_frames"])))
@@ -83,6 +84,11 @@ class VisualMoveItGraspNode(Node):
         self.move_line_client = self.create_client(
             MoveLineCmd,
             "/move_line_cmd",
+            callback_group=self.callback_group,
+        )
+        self.move_joint_client = self.create_client(
+            MoveJointCmd,
+            "/move_joint_cmd",
             callback_group=self.callback_group,
         )
         self.timer = self.create_timer(
@@ -510,6 +516,51 @@ class VisualMoveItGraspNode(Node):
         )
         return bool(result.success)
 
+    def move_joint_mm(self, stage_name, x_mm, y_mm, z_mm, roll, pitch, yaw):
+        if not self.workspace_contains(x_mm, y_mm, z_mm):
+            self.get_logger().error(
+                f"{stage_name} 超出工作空间，拒绝调用 move_joint: "
+                f"x={x_mm:.1f} y={y_mm:.1f} z={z_mm:.1f} mm"
+            )
+            return False
+
+        x_m, y_m, z_m = self.to_moveit_xyz(x_mm, y_mm, z_mm)
+        self.get_logger().info(
+            f"{stage_name}: mm=({x_mm:.1f},{y_mm:.1f},{z_mm:.1f}) -> "
+            f"moveit({self.cfg['moveit_frame_id']}) m=({x_m:.4f},{y_m:.4f},{z_m:.4f}), "
+            f"rpy=({roll:.4f},{pitch:.4f},{yaw:.4f})"
+        )
+
+        if self.bool_cfg("dry_run"):
+            self.get_logger().info(f"{stage_name}: dry_run=true，仅打印，不调用 /move_joint_cmd")
+            return True
+
+        if not self.move_joint_client.wait_for_service(timeout_sec=self.service_wait_timeout_s):
+            self.get_logger().error("/move_joint_cmd 服务不可用")
+            return False
+
+        req = MoveJointCmd.Request()
+        req.x = float(x_m)
+        req.y = float(y_m)
+        req.z = float(z_m)
+        req.roll = float(roll)
+        req.pitch = float(pitch)
+        req.yaw = float(yaw)
+        future = self.move_joint_client.call_async(req)
+        if not self.wait_for_future(future, self.move_joint_timeout_s):
+            self.get_logger().error(f"{stage_name}: /move_joint_cmd 调用超时")
+            return False
+
+        result = future.result()
+        if result is None:
+            self.get_logger().error(f"{stage_name}: /move_joint_cmd 返回空结果")
+            return False
+
+        self.get_logger().info(
+            f"{stage_name}: /move_joint_cmd success={result.success} message={result.message}"
+        )
+        return bool(result.success)
+
     def publish_gripper(self, value, stage_name):
         self.get_logger().info(f"{stage_name}: gripper_cmd={float(value):.3f}")
         if not self.bool_cfg("enable_gripper"):
@@ -607,12 +658,23 @@ class VisualMoveItGraspNode(Node):
                 f"mm=({pre_grasp['x_mm']:.1f},{pre_grasp['y_mm']:.1f},{pre_grasp['z_mm']:.1f}) "
                 f"rpy=({grasp_rpy['roll']:.4f},{grasp_rpy['pitch']:.4f},{grasp_rpy['yaw']:.4f})"
             )
-            ok = self.move_line_mm(
-                "MOVE_TO_PRE_GRASP",
-                pre_grasp["x_mm"],
-                pre_grasp["y_mm"],
-                pre_grasp["z_mm"],
-            )
+            if self.bool_cfg("use_move_joint_for_pre_grasp"):
+                ok = self.move_joint_mm(
+                    "MOVE_TO_PRE_GRASP",
+                    pre_grasp["x_mm"],
+                    pre_grasp["y_mm"],
+                    pre_grasp["z_mm"],
+                    grasp_rpy["roll"],
+                    grasp_rpy["pitch"],
+                    grasp_rpy["yaw"],
+                )
+            else:
+                ok = self.move_line_mm(
+                    "MOVE_TO_PRE_GRASP",
+                    pre_grasp["x_mm"],
+                    pre_grasp["y_mm"],
+                    pre_grasp["z_mm"],
+                )
             if ok:
                 self.settle_after_motion("MOVE_TO_PRE_GRASP", self.float_cfg("pre_grasp_settle_s", 0.5))
             self.set_state("MOVE_LINE_TO_GRASP" if ok else "RECOVER", "预抓取位成功" if ok else "预抓取位失败")
@@ -629,12 +691,23 @@ class VisualMoveItGraspNode(Node):
                 f"mm=({grasp['x_mm']:.1f},{grasp['y_mm']:.1f},{grasp['z_mm']:.1f}) "
                 f"rpy=({grasp_rpy['roll']:.4f},{grasp_rpy['pitch']:.4f},{grasp_rpy['yaw']:.4f})"
             )
-            ok = self.move_line_mm(
-                "MOVE_LINE_TO_GRASP",
-                grasp["x_mm"],
-                grasp["y_mm"],
-                grasp["z_mm"],
-            )
+            if self.bool_cfg("use_move_joint_for_grasp"):
+                ok = self.move_joint_mm(
+                    "MOVE_LINE_TO_GRASP",
+                    grasp["x_mm"],
+                    grasp["y_mm"],
+                    grasp["z_mm"],
+                    grasp_rpy["roll"],
+                    grasp_rpy["pitch"],
+                    grasp_rpy["yaw"],
+                )
+            else:
+                ok = self.move_line_mm(
+                    "MOVE_LINE_TO_GRASP",
+                    grasp["x_mm"],
+                    grasp["y_mm"],
+                    grasp["z_mm"],
+                )
             if ok:
                 self.settle_after_motion("MOVE_LINE_TO_GRASP", self.float_cfg("grasp_settle_s", 1.0))
             self.set_state("CLOSE_GRIPPER" if ok else "RECOVER", "抓取位成功" if ok else "抓取位失败")
@@ -659,7 +732,18 @@ class VisualMoveItGraspNode(Node):
                 f"mm=({lift['x_mm']:.1f},{lift['y_mm']:.1f},{lift['z_mm']:.1f}) "
                 f"rpy=({grasp_rpy['roll']:.4f},{grasp_rpy['pitch']:.4f},{grasp_rpy['yaw']:.4f})"
             )
-            ok = self.move_line_mm("LIFT", lift["x_mm"], lift["y_mm"], lift["z_mm"])
+            if self.bool_cfg("use_move_joint_for_lift"):
+                ok = self.move_joint_mm(
+                    "LIFT",
+                    lift["x_mm"],
+                    lift["y_mm"],
+                    lift["z_mm"],
+                    grasp_rpy["roll"],
+                    grasp_rpy["pitch"],
+                    grasp_rpy["yaw"],
+                )
+            else:
+                ok = self.move_line_mm("LIFT", lift["x_mm"], lift["y_mm"], lift["z_mm"])
             if ok:
                 self.settle_after_motion("LIFT", self.float_cfg("lift_settle_s", 0.5))
             self.set_state("DONE" if ok else "RECOVER", "抬升成功" if ok else "抬升失败")
